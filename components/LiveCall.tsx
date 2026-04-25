@@ -31,7 +31,7 @@ const GROQ_MODELS = [
   { value: 'mixtral-8x7b-32768',      label: 'Mixtral 8x7B' },
 ];
 
-const CHUNK_INTERVAL = 5000;      // ms between transcription sends
+const CHUNK_INTERVAL = 2000;      // ms between transcription sends (low latency)
 // VAD threshold — applied to the *peak* (max) frequency bin (0–255).
 // Using max instead of average gives real speech values of 40–200+.
 // Silence ≈ 0–10, background noise ≈ 10–25, speech ≈ 30+
@@ -252,7 +252,7 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
       processChunk(blobChunks, speaker, peak);
     }, CHUNK_INTERVAL);
 
-    recorder.start(1000);
+    recorder.start(500);   // collect chunks every 500 ms for low-latency flush
     return recorder;
   }, [processChunk]);
 
@@ -397,7 +397,7 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
                 {recording
                   ? <span className="flex items-center gap-2">
                       <span className="inline-flex gap-1">{[0,150,300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}</span>
-                      Listening — transcript appears every ~5 seconds when speech is detected
+                      Listening — transcript appears every ~2 seconds when speech is detected
                     </span>
                   : 'Transcript will appear here once you start recording'}
               </div>
