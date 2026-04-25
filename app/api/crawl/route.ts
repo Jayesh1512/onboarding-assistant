@@ -10,8 +10,11 @@ export async function POST(req: NextRequest) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (data: object) =>
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+      const send = (data: object) => {
+        // Safely serialize — truncate any single field > 200KB to avoid broken JSON
+        const str = JSON.stringify(data);
+        controller.enqueue(encoder.encode(`data: ${str}\n\n`));
+      };
 
       try {
         send({ type: 'start', message: `Starting crawl: ${url}` });
@@ -20,12 +23,17 @@ export async function POST(req: NextRequest) {
           send({ type: 'progress', crawled, total, currentUrl });
         });
 
-        // Return extracted text to client — no server-side storage
-        send({
-          type: 'done',
-          pages: results.map((r) => ({ url: r.url, text: r.text })),
-          pagesAdded: results.length,
-        });
+        // Send each page as a separate event (avoids single giant JSON payload)
+        for (const result of results) {
+          send({
+            type: 'page',
+            url: result.url,
+            // Truncate per-page text to 50KB to keep events manageable
+            text: result.text.slice(0, 50000),
+          });
+        }
+
+        send({ type: 'done', pagesAdded: results.length });
       } catch (err) {
         send({ type: 'error', message: String(err) });
       } finally {

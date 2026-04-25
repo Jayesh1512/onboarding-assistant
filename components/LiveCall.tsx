@@ -2,12 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 
-interface Question {
-  id: string;
-  text: string;
-  asked: boolean;
-  notes: string;
-}
+interface Question { id: string; text: string; asked: boolean; notes: string }
 
 type Speaker = 'you' | 'client';
 
@@ -28,42 +23,40 @@ interface Props {
 }
 
 const QUESTION_STARTERS = /^(what|how|why|when|where|who|which|is|are|do|does|can|could|would|will|should|have|has|did|tell me|explain|describe)/i;
-
-function isLikelyQuestion(text: string): boolean {
-  const t = text.trim();
-  return t.endsWith('?') || QUESTION_STARTERS.test(t);
-}
+const isLikelyQuestion = (t: string) => t.trim().endsWith('?') || QUESTION_STARTERS.test(t.trim());
 
 const GROQ_MODELS = [
-  { value: 'llama-3.1-8b-instant', label: 'Llama 3.1 8B (fast, free)' },
-  { value: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B (smart, free)' },
-  { value: 'gemma2-9b-it', label: 'Gemma 2 9B (free)' },
-  { value: 'mixtral-8x7b-32768', label: 'Mixtral 8x7B (free)' },
+  { value: 'llama-3.1-8b-instant',    label: 'Llama 3.1 8B (fast)' },
+  { value: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B (smart)' },
+  { value: 'gemma2-9b-it',            label: 'Gemma 2 9B' },
+  { value: 'mixtral-8x7b-32768',      label: 'Mixtral 8x7B' },
 ];
 
+// Chunk interval in ms — 5s balances latency vs Groq rate limits
+const CHUNK_INTERVAL = 5000;
+
 export default function LiveCall({ questions, context, onToggleQuestion }: Props) {
-  const [recording, setRecording] = useState(false);
-  const [speaker, setSpeaker] = useState<Speaker>('you');
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [interim, setInterim] = useState('');
-  const [model, setModel] = useState('llama-3.1-8b-instant');
+  const [recording, setRecording]     = useState(false);
+  const [transcript, setTranscript]   = useState<TranscriptEntry[]>([]);
+  const [model, setModel]             = useState('llama-3.1-8b-instant');
   const [manualInput, setManualInput] = useState('');
-  const [supported, setSupported] = useState(true);
-  const [error, setError] = useState('');
+  const [status, setStatus]           = useState('');
+  const [error, setError]             = useState('');
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const recognitionRef = useRef<any>(null);
-  const speakerRef = useRef<Speaker>('you');
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const restartingRef = useRef(false);
+  const micRecorderRef    = useRef<MediaRecorder | null>(null);
+  const systemRecorderRef = useRef<MediaRecorder | null>(null);
+  const micChunksRef      = useRef<Blob[]>([]);
+  const sysChunksRef      = useRef<Blob[]>([]);
+  const micIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const sysIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const bottomRef         = useRef<HTMLDivElement>(null);
+  const hasKB             = context.length > 0;
 
-  useEffect(() => { speakerRef.current = speaker; }, [speaker]);
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [transcript, interim]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [transcript]);
 
-  const hasKB = context.length > 0;
-
+  // ─── AI answer for a client question ────────────────────────────────────────
   const getAiAnswer = useCallback(async (entryId: string, question: string) => {
-    setTranscript((prev) => prev.map((e) => e.id === entryId ? { ...e, aiLoading: true, aiAnswer: '' } : e));
+    setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiLoading: true, aiAnswer: '' } : e));
     try {
       const res = await fetch('/api/ask', {
         method: 'POST',
@@ -71,144 +64,194 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
         body: JSON.stringify({ question, context, model }),
       });
       const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
+      const dec = new TextDecoder();
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        for (const line of decoder.decode(value).split('\n').filter((l) => l.startsWith('data: '))) {
-          const data = JSON.parse(line.slice(6));
-          if (data.text) setTranscript((prev) => prev.map((e) => e.id === entryId ? { ...e, aiAnswer: (e.aiAnswer || '') + data.text } : e));
-          else if (data.done) setTranscript((prev) => prev.map((e) => e.id === entryId ? { ...e, aiLoading: false } : e));
-          else if (data.error) setTranscript((prev) => prev.map((e) => e.id === entryId ? { ...e, aiLoading: false, aiAnswer: `⚠️ ${data.error}` } : e));
+        for (const line of dec.decode(value).split('\n').filter((l) => l.startsWith('data: '))) {
+          const d = JSON.parse(line.slice(6));
+          if (d.text) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiAnswer: (e.aiAnswer || '') + d.text } : e));
+          if (d.done) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiLoading: false } : e));
+          if (d.error) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiLoading: false, aiAnswer: `⚠️ ${d.error}` } : e));
         }
       }
     } catch (e) {
-      setTranscript((prev) => prev.map((entry) => entry.id === entryId ? { ...entry, aiLoading: false, aiAnswer: `⚠️ ${String(e)}` } : entry));
+      setTranscript((p) => p.map((en) => en.id === entryId ? { ...en, aiLoading: false, aiAnswer: `⚠️ ${String(e)}` } : en));
     }
   }, [model, context]);
 
-  const tryMatchYourQuestion = useCallback(async (spoken: string) => {
+  // ─── Fuzzy match your spoken words to checklist ──────────────────────────────
+  const tryMatchChecklist = useCallback(async (spoken: string): Promise<string | null> => {
     try {
       const res = await fetch('/api/match-question', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ spoken, questions }),
       });
-      const data = await res.json();
-      if (data.match) { onToggleQuestion(data.match); return data.match as string; }
+      const d = await res.json();
+      if (d.match) { onToggleQuestion(d.match); return d.match; }
     } catch { /* silent */ }
     return null;
-  }, [onToggleQuestion, questions]);
+  }, [questions, onToggleQuestion]);
 
-  const handleFinalTranscript = useCallback(async (text: string) => {
-    if (!text.trim()) return;
-    const currentSpeaker = speakerRef.current;
-    const isQuestion = isLikelyQuestion(text);
-    const entryId = Date.now().toString();
-    setTranscript((prev) => [...prev, { id: entryId, speaker: currentSpeaker, text: text.trim(), isQuestion }]);
-    if (currentSpeaker === 'client' && isQuestion && hasKB) {
-      getAiAnswer(entryId, text.trim());
-    } else if (currentSpeaker === 'you') {
-      const matchedId = await tryMatchYourQuestion(text.trim());
-      if (matchedId) setTranscript((prev) => prev.map((e) => e.id === entryId ? { ...e, matchedQuestionId: matchedId } : e));
-    }
-  }, [hasKB, getAiAnswer, tryMatchYourQuestion]);
+  // ─── Process a finished audio chunk ─────────────────────────────────────────
+  const processChunk = useCallback(async (chunks: Blob[], speaker: Speaker) => {
+    if (!chunks.length) return;
+    const blob = new Blob(chunks, { type: 'audio/webm' });
+    if (blob.size < 1000) return; // too small — probably silence
 
-  const startRecording = useCallback(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const w = window as any;
-    const SR = w.SpeechRecognition || w.webkitSpeechRecognition;
-    if (!SR) { setSupported(false); return; }
-    const rec = new SR();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = 'en-US';
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    rec.onresult = (event: any) => {
-      let interimText = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        if (event.results[i].isFinal) { handleFinalTranscript(event.results[i][0].transcript); setInterim(''); }
-        else interimText += event.results[i][0].transcript;
+    const fd = new FormData();
+    fd.append('audio', blob, 'audio.webm');
+    fd.append('speaker', speaker);
+
+    try {
+      const res = await fetch('/api/transcribe', { method: 'POST', body: fd });
+      const { text } = await res.json() as { text: string };
+      if (!text?.trim()) return;
+
+      const entryId = Date.now().toString() + speaker;
+      const isQuestion = isLikelyQuestion(text);
+
+      setTranscript((p) => [...p, { id: entryId, speaker, text: text.trim(), isQuestion }]);
+
+      if (speaker === 'client' && isQuestion && hasKB) {
+        getAiAnswer(entryId, text.trim());
+      } else if (speaker === 'you') {
+        const matchId = await tryMatchChecklist(text.trim());
+        if (matchId) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, matchedQuestionId: matchId } : e));
       }
-      setInterim(interimText);
+    } catch { /* ignore single bad chunk */ }
+  }, [hasKB, getAiAnswer, tryMatchChecklist]);
+
+  // ─── Build a MediaRecorder for a stream ─────────────────────────────────────
+  const buildRecorder = useCallback((
+    stream: MediaStream,
+    chunksRef: React.MutableRefObject<Blob[]>,
+    intervalRef: React.MutableRefObject<ReturnType<typeof setInterval> | null>,
+    speaker: Speaker,
+  ) => {
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : 'audio/webm';
+
+    const recorder = new MediaRecorder(stream, { mimeType });
+    chunksRef.current = [];
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
     };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    rec.onerror = (event: any) => {
-      if (event.error !== 'no-speech' && event.error !== 'aborted') { setError(`Mic error: ${event.error}`); setRecording(false); }
-    };
-    rec.onend = () => { if (restartingRef.current) try { rec.start(); } catch { /* ok */ } };
-    recognitionRef.current = rec;
-    restartingRef.current = true;
+
+    // Every CHUNK_INTERVAL ms, flush & transcribe accumulated chunks
+    intervalRef.current = setInterval(() => {
+      if (chunksRef.current.length === 0) return;
+      const toSend = [...chunksRef.current];
+      chunksRef.current = [];
+      processChunk(toSend, speaker);
+    }, CHUNK_INTERVAL);
+
+    recorder.start(1000); // collect data every 1s, flush every 5s
+    return recorder;
+  }, [processChunk]);
+
+  // ─── Start recording ─────────────────────────────────────────────────────────
+  const startRecording = useCallback(async () => {
     setError('');
-    try { rec.start(); setRecording(true); } catch { setError('Could not start mic. Check browser permissions.'); }
-  }, [handleFinalTranscript]);
+    setStatus('Requesting microphone…');
 
+    try {
+      // 1. Mic stream — YOUR voice
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
+      });
+
+      setStatus('Requesting system audio — select your Google Meet tab and enable "Share tab audio"…');
+
+      // 2. System audio — CLIENT's voice (tab/screen capture)
+      let sysStream: MediaStream | null = null;
+      try {
+        const displayStream = await navigator.mediaDevices.getDisplayMedia({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          video: true as any,
+          audio: { echoCancellation: false, noiseSuppression: false, sampleRate: 16000 },
+        });
+        // Stop video track — we only want audio
+        displayStream.getVideoTracks().forEach((t) => t.stop());
+        sysStream = displayStream;
+      } catch {
+        // User cancelled screen share — continue with mic only
+        setStatus('⚠️ No system audio selected. Only your voice will be transcribed.');
+      }
+
+      // 3. Start recorders
+      micRecorderRef.current = buildRecorder(micStream, micChunksRef, micIntervalRef, 'you');
+      if (sysStream && sysStream.getAudioTracks().length > 0) {
+        systemRecorderRef.current = buildRecorder(sysStream, sysChunksRef, sysIntervalRef, 'client');
+        setStatus('Recording — both voices active');
+      } else {
+        setStatus('Recording — your voice only');
+      }
+
+      setRecording(true);
+    } catch (e) {
+      setError(`Could not start recording: ${String(e)}`);
+      setStatus('');
+    }
+  }, [buildRecorder]);
+
+  // ─── Stop recording ───────────────────────────────────────────────────────────
   const stopRecording = useCallback(() => {
-    restartingRef.current = false;
-    recognitionRef.current?.stop();
-    recognitionRef.current = null;
-    setRecording(false);
-    setInterim('');
-  }, []);
+    [micIntervalRef, sysIntervalRef].forEach((ref) => { if (ref.current) clearInterval(ref.current); });
 
+    // Flush remaining chunks
+    if (micChunksRef.current.length) processChunk([...micChunksRef.current], 'you');
+    if (sysChunksRef.current.length) processChunk([...sysChunksRef.current], 'client');
+
+    micRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
+    systemRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
+    micRecorderRef.current?.stop();
+    systemRecorderRef.current?.stop();
+
+    micRecorderRef.current = null;
+    systemRecorderRef.current = null;
+    micChunksRef.current = [];
+    sysChunksRef.current = [];
+
+    setRecording(false);
+    setStatus('');
+  }, [processChunk]);
+
+  // ─── Manual Q&A ──────────────────────────────────────────────────────────────
   const askManual = async () => {
     const q = manualInput.trim();
     if (!q) return;
     const entryId = Date.now().toString();
-    setTranscript((prev) => [...prev, { id: entryId, speaker: 'client', text: q, isQuestion: true }]);
+    setTranscript((p) => [...p, { id: entryId, speaker: 'client', text: q, isQuestion: true }]);
     setManualInput('');
     if (hasKB) getAiAnswer(entryId, q);
   };
 
-  if (!supported) {
-    return (
-      <div className="flex items-center justify-center h-64 text-center">
-        <div className="space-y-2">
-          <p className="text-slate-300 font-medium">Speech recognition not supported</p>
-          <p className="text-slate-500 text-sm">Use Chrome or Edge for live transcription.</p>
-        </div>
-      </div>
-    );
-  }
-
-  const pending = questions.filter((q) => !q.asked);
-  const askedQs = questions.filter((q) => q.asked);
+  const pending  = questions.filter((q) => !q.asked);
+  const askedQs  = questions.filter((q) => q.asked);
 
   return (
     <div className="flex flex-col gap-4" style={{ height: 'calc(100vh - 120px)' }}>
 
-      {/* Controls bar */}
+      {/* Controls */}
       <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={recording ? stopRecording : startRecording}
-          className={`flex items-center gap-2 px-4 py-2 rounded-xl font-medium text-sm transition-all ${recording ? 'bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-900/40' : 'bg-slate-700 hover:bg-slate-600 text-slate-100'}`}
-        >
+        <button onClick={recording ? stopRecording : startRecording}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl font-medium text-sm transition-all ${recording ? 'bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-900/40' : 'bg-slate-700 hover:bg-slate-600 text-slate-100'}`}>
           <span className={`w-2 h-2 rounded-full ${recording ? 'bg-white animate-pulse' : 'bg-slate-400'}`} />
           {recording ? 'Stop Recording' : 'Start Recording'}
         </button>
 
-        {/* Speaker toggle */}
-        <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-800 border border-slate-700">
-          <button onClick={() => setSpeaker('you')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${speaker === 'you' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}>
-            You speaking
-          </button>
-          <button onClick={() => setSpeaker('client')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${speaker === 'client' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}>
-            Client speaking
-          </button>
-        </div>
-
-        {/* Model picker */}
         <select value={model} onChange={(e) => setModel(e.target.value)}
           className="px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
           {GROQ_MODELS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
         </select>
 
-        {/* KB status */}
         <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border ${hasKB ? 'border-green-800 bg-green-900/20 text-green-400' : 'border-slate-700 text-slate-500'}`}>
           <div className={`w-1.5 h-1.5 rounded-full ${hasKB ? 'bg-green-400' : 'bg-slate-500'}`} />
-          {hasKB ? `Knowledge base loaded` : 'No knowledge base — add content in Prep tab'}
+          {hasKB ? 'Knowledge base loaded' : 'No knowledge base — add content in Prep tab'}
         </div>
 
         {transcript.length > 0 && (
@@ -219,7 +262,18 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
         )}
       </div>
 
-      {error && <div className="px-4 py-2 rounded-lg bg-red-900/30 border border-red-700 text-red-300 text-sm">{error}</div>}
+      {/* Status / how-to hint */}
+      {(status || !recording) && (
+        <div className={`px-4 py-3 rounded-xl text-sm border ${error ? 'bg-red-900/30 border-red-700 text-red-300' : 'bg-slate-800/60 border-slate-700 text-slate-400'}`}>
+          {error || status || (
+            <span>
+              Press <strong className="text-slate-200">Start Recording</strong>. Allow mic access, then a screen-share dialog will appear —
+              select your <strong className="text-slate-200">Google Meet tab</strong> and check{' '}
+              <strong className="text-slate-200">"Share tab audio"</strong>. Your mic = <span className="text-indigo-400">You</span>, Meet audio = <span className="text-emerald-400">Client</span>.
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Main area */}
       <div className="flex gap-4 flex-1 min-h-0">
@@ -229,25 +283,30 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Live Transcript</h3>
             <div className="flex items-center gap-3 text-xs text-slate-500">
-              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-indigo-500/60 inline-block" />You</span>
-              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-emerald-500/60 inline-block" />Client</span>
-              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-amber-500/60 inline-block" />Client Q + AI answer</span>
+              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-indigo-500/60" />You (mic)</span>
+              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-emerald-500/60" />Client (system audio)</span>
+              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-amber-500/60" />Client question + AI answer</span>
             </div>
           </div>
 
           <div className="flex-1 overflow-y-auto scrollbar-thin space-y-3 pr-1 rounded-xl bg-slate-900/50 border border-slate-800 p-4">
-            {transcript.length === 0 && !interim && (
+            {transcript.length === 0 && (
               <div className="flex items-center justify-center h-full text-slate-600 text-sm text-center">
-                {recording
-                  ? `Listening… (${speaker === 'you' ? 'You' : 'Client'} speaking)`
-                  : 'Press Start Recording, then toggle who is speaking as the conversation flows'}
+                {recording ? (
+                  <span className="flex items-center gap-2">
+                    <span className="inline-flex gap-1">
+                      {[0,150,300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}
+                    </span>
+                    Listening — transcript will appear every ~5 seconds
+                  </span>
+                ) : 'Transcript will appear here once you start recording'}
               </div>
             )}
 
             {transcript.map((entry) => (
               <div key={entry.id}>
                 <div className="flex items-start gap-2">
-                  <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold mt-0.5 ${entry.speaker === 'you' ? 'bg-indigo-600' : 'bg-emerald-600'} text-white`}>
+                  <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold mt-0.5 text-white ${entry.speaker === 'you' ? 'bg-indigo-600' : 'bg-emerald-600'}`}>
                     {entry.speaker === 'you' ? 'Y' : 'C'}
                   </div>
                   <div className="flex-1">
@@ -269,14 +328,13 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
                       </div>
                     </div>
 
-                    {/* AI Answer */}
                     {(entry.aiAnswer !== undefined || entry.aiLoading) && (
                       <div className="mt-2 ml-2 pl-3 border-l-2 border-amber-600/40">
                         <p className="text-xs text-amber-500 font-medium mb-1">AI Answer</p>
                         {entry.aiLoading && !entry.aiAnswer ? (
                           <span className="flex items-center gap-1.5 text-slate-500 text-sm">
                             <span className="inline-flex gap-1">
-                              {[0, 150, 300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-amber-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}
+                              {[0,150,300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-amber-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}
                             </span>
                             Looking up answer…
                           </span>
@@ -292,27 +350,15 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
                 </div>
               </div>
             ))}
-
-            {/* Interim live text */}
-            {interim && (
-              <div className="flex items-start gap-2 opacity-60">
-                <div className={`flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${speaker === 'you' ? 'bg-indigo-600' : 'bg-emerald-600'} text-white`}>
-                  {speaker === 'you' ? 'Y' : 'C'}
-                </div>
-                <div className={`px-3 py-2 rounded-xl rounded-tl-sm text-sm italic ${speaker === 'you' ? 'bg-indigo-950/40 border border-indigo-800/30 text-indigo-300' : 'bg-emerald-950/40 border border-emerald-800/30 text-emerald-300'}`}>
-                  {interim}<span className="inline-block w-1 h-4 bg-current ml-0.5 animate-pulse" />
-                </div>
-              </div>
-            )}
             <div ref={bottomRef} />
           </div>
 
-          {/* Manual input */}
+          {/* Manual input fallback */}
           <div className="space-y-1.5">
-            <p className="text-xs text-slate-500">Manual lookup — type a client question to get an answer instantly:</p>
+            <p className="text-xs text-slate-500">Manual — type a client question to look up instantly:</p>
             <div className="flex gap-2">
               <input type="text" value={manualInput} onChange={(e) => setManualInput(e.target.value)}
-                placeholder={hasKB ? 'Type client question manually…' : 'Load knowledge base first…'}
+                placeholder={hasKB ? 'Type client question…' : 'Load knowledge base first…'}
                 disabled={!hasKB}
                 className="flex-1 px-3 py-2 rounded-xl bg-slate-800 border border-slate-700 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-amber-500 disabled:opacity-50"
                 onKeyDown={(e) => e.key === 'Enter' && askManual()} />
@@ -324,11 +370,10 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
           </div>
         </div>
 
-        {/* Right: checklist sidebar */}
+        {/* Checklist sidebar */}
         <div className="w-64 flex-shrink-0 flex flex-col gap-3 min-h-0">
           <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-            Your Questions
-            {pending.length > 0 && <span className="ml-2 text-indigo-400">{pending.length} left</span>}
+            Your Questions{pending.length > 0 && <span className="ml-2 text-indigo-400">{pending.length} left</span>}
           </h3>
 
           {questions.length === 0 ? (

@@ -56,11 +56,11 @@ export default function KnowledgeBase({ sources, onAdd, onRemove, onClear }: Pro
           const data = JSON.parse(line.slice(6));
           if (data.type === 'progress') {
             setCrawlLog((p) => [...p.slice(-30), `[${data.crawled}/${data.total}] ${data.currentUrl}`]);
+          } else if (data.type === 'page') {
+            // Each page arrives as its own event — no giant JSON payload
+            onAdd({ id: `${Date.now()}-${Math.random()}`, label: data.url, content: data.text, addedAt: new Date().toISOString() });
           } else if (data.type === 'done') {
-            for (const page of data.pages as { url: string; text: string }[]) {
-              onAdd({ id: `${Date.now()}-${page.url}`, label: page.url, content: page.text, addedAt: new Date().toISOString() });
-            }
-            setCrawlLog((p) => [...p, `Done! Added ${data.pagesAdded} pages`]);
+            setCrawlLog((p) => [...p, `✓ Done — ${data.pagesAdded} pages added`]);
             setUrlInput('');
           } else if (data.type === 'error') {
             setCrawlLog((p) => [...p, `Error: ${data.message}`]);
