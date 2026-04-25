@@ -3,7 +3,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 
 interface Question { id: string; text: string; asked: boolean; notes: string }
-
 type Speaker = 'you' | 'client';
 
 interface TranscriptEntry {
@@ -32,16 +31,91 @@ const GROQ_MODELS = [
   { value: 'mixtral-8x7b-32768',      label: 'Mixtral 8x7B' },
 ];
 
-// Chunk interval in ms — 5s balances latency vs Groq rate limits
-const CHUNK_INTERVAL = 5000;
+const CHUNK_INTERVAL = 5000;        // ms between transcription sends
+const SPEECH_THRESHOLD = 8;         // 0–255 RMS level — below this = silence/noise, skip Whisper
+const HALLUCINATIONS = new Set([    // known Whisper noise hallucinations to silently drop
+  'thank you', 'thanks', 'thank you.', 'thanks.', 'you', 'the',
+  'thanks for watching', 'thank you for watching', 'bye', 'bye.',
+  'please subscribe', 'like and subscribe', '...', '. . .',
+]);
+
+// ─── Measure RMS audio level of a Blob (0–255) ──────────────────────────────
+async function measureRMS(blob: Blob): Promise<number> {
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new AudioContext();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    const data = audioBuffer.getChannelData(0);
+    const rms = Math.sqrt(data.reduce((sum, v) => sum + v * v, 0) / data.length);
+    audioCtx.close();
+    return rms * 255; // scale to 0–255
+  } catch {
+    return 0;
+  }
+}
+
+// ─── Live level meter using AnalyserNode ────────────────────────────────────
+function useLevelMeter(stream: MediaStream | null) {
+  const [level, setLevel] = useState(0);
+  const rafRef = useRef<number>(0);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const ctxRef = useRef<AudioContext | null>(null);
+
+  useEffect(() => {
+    if (!stream) { setLevel(0); return; }
+    const ctx = new AudioContext();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    ctxRef.current = ctx;
+    analyserRef.current = analyser;
+    const data = new Uint8Array(analyser.frequencyBinCount);
+
+    const tick = () => {
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      setLevel(avg);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      cancelAnimationFrame(rafRef.current);
+      ctx.close();
+    };
+  }, [stream]);
+
+  return level;
+}
+
+// ─── Level bar component ─────────────────────────────────────────────────────
+function LevelBar({ level, label, color }: { level: number; label: string; color: string }) {
+  const pct = Math.min(100, (level / 60) * 100);
+  const isActive = level > SPEECH_THRESHOLD;
+  return (
+    <div className="flex items-center gap-2 min-w-0">
+      <span className="text-xs text-slate-500 w-14 flex-shrink-0">{label}</span>
+      <div className="flex-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+        <div className="h-full rounded-full transition-all duration-75"
+          style={{ width: `${pct}%`, background: isActive ? color : '#334155' }} />
+      </div>
+      <span className={`text-xs w-12 flex-shrink-0 ${isActive ? 'text-slate-300' : 'text-slate-600'}`}>
+        {isActive ? 'Speech' : 'Silence'}
+      </span>
+    </div>
+  );
+}
 
 export default function LiveCall({ questions, context, onToggleQuestion }: Props) {
-  const [recording, setRecording]     = useState(false);
-  const [transcript, setTranscript]   = useState<TranscriptEntry[]>([]);
-  const [model, setModel]             = useState('llama-3.1-8b-instant');
-  const [manualInput, setManualInput] = useState('');
-  const [status, setStatus]           = useState('');
-  const [error, setError]             = useState('');
+  const [recording, setRecording]       = useState(false);
+  const [transcript, setTranscript]     = useState<TranscriptEntry[]>([]);
+  const [model, setModel]               = useState('llama-3.1-8b-instant');
+  const [manualInput, setManualInput]   = useState('');
+  const [status, setStatus]             = useState('');
+  const [error, setError]               = useState('');
+  const [micStream, setMicStream]       = useState<MediaStream | null>(null);
+  const [sysStream, setSysStream]       = useState<MediaStream | null>(null);
+  const [skippedCount, setSkippedCount] = useState(0); // silence skips counter
 
   const micRecorderRef    = useRef<MediaRecorder | null>(null);
   const systemRecorderRef = useRef<MediaRecorder | null>(null);
@@ -52,9 +126,13 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
   const bottomRef         = useRef<HTMLDivElement>(null);
   const hasKB             = context.length > 0;
 
+  // Live level meters
+  const micLevel = useLevelMeter(micStream);
+  const sysLevel = useLevelMeter(sysStream);
+
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [transcript]);
 
-  // ─── AI answer for a client question ────────────────────────────────────────
+  // ─── AI answer ──────────────────────────────────────────────────────────────
   const getAiAnswer = useCallback(async (entryId: string, question: string) => {
     setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiLoading: true, aiAnswer: '' } : e));
     try {
@@ -70,8 +148,7 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
         const { done, value } = await reader.read();
         if (done) break;
         buf += dec.decode(value, { stream: true });
-        const parts = buf.split('\n\n');
-        buf = parts.pop() ?? '';
+        const parts = buf.split('\n\n'); buf = parts.pop() ?? '';
         for (const part of parts) {
           const line = part.trim();
           if (!line.startsWith('data: ')) continue;
@@ -80,7 +157,7 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
             if (d.text) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiAnswer: (e.aiAnswer || '') + d.text } : e));
             if (d.done) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiLoading: false } : e));
             if (d.error) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiLoading: false, aiAnswer: `⚠️ ${d.error}` } : e));
-          } catch { /* skip malformed chunk */ }
+          } catch { /* skip */ }
         }
       }
     } catch (e) {
@@ -88,12 +165,11 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     }
   }, [model, context]);
 
-  // ─── Fuzzy match your spoken words to checklist ──────────────────────────────
+  // ─── Checklist match ─────────────────────────────────────────────────────────
   const tryMatchChecklist = useCallback(async (spoken: string): Promise<string | null> => {
     try {
       const res = await fetch('/api/match-question', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ spoken, questions }),
       });
       const d = await res.json();
@@ -102,11 +178,19 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     return null;
   }, [questions, onToggleQuestion]);
 
-  // ─── Process a finished audio chunk ─────────────────────────────────────────
+  // ─── Process audio chunk with VAD ────────────────────────────────────────────
   const processChunk = useCallback(async (chunks: Blob[], speaker: Speaker) => {
     if (!chunks.length) return;
     const blob = new Blob(chunks, { type: 'audio/webm' });
-    if (blob.size < 1000) return; // too small — probably silence
+    if (blob.size < 500) return;
+
+    // ── Voice Activity Detection ──────────────────────────────────────────────
+    const rms = await measureRMS(blob);
+    if (rms < SPEECH_THRESHOLD) {
+      // Audio level too low — skip Whisper to avoid hallucinations
+      setSkippedCount((n) => n + 1);
+      return;
+    }
 
     const fd = new FormData();
     fd.append('audio', blob, 'audio.webm');
@@ -117,9 +201,14 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
       const { text } = await res.json() as { text: string };
       if (!text?.trim()) return;
 
-      const entryId = Date.now().toString() + speaker;
-      const isQuestion = isLikelyQuestion(text);
+      // ── Drop known Whisper hallucinations ────────────────────────────────────
+      if (HALLUCINATIONS.has(text.trim().toLowerCase())) {
+        setSkippedCount((n) => n + 1);
+        return;
+      }
 
+      const entryId = `${Date.now()}-${speaker}`;
+      const isQuestion = isLikelyQuestion(text);
       setTranscript((p) => [...p, { id: entryId, speaker, text: text.trim(), isQuestion }]);
 
       if (speaker === 'client' && isQuestion && hasKB) {
@@ -131,104 +220,73 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     } catch { /* ignore single bad chunk */ }
   }, [hasKB, getAiAnswer, tryMatchChecklist]);
 
-  // ─── Build a MediaRecorder for a stream ─────────────────────────────────────
+  // ─── Build MediaRecorder ─────────────────────────────────────────────────────
   const buildRecorder = useCallback((
     stream: MediaStream,
     chunksRef: React.MutableRefObject<Blob[]>,
     intervalRef: React.MutableRefObject<ReturnType<typeof setInterval> | null>,
     speaker: Speaker,
   ) => {
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus'
-      : 'audio/webm';
-
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
     const recorder = new MediaRecorder(stream, { mimeType });
     chunksRef.current = [];
-
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) chunksRef.current.push(e.data);
-    };
-
-    // Every CHUNK_INTERVAL ms, flush & transcribe accumulated chunks
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
     intervalRef.current = setInterval(() => {
-      if (chunksRef.current.length === 0) return;
-      const toSend = [...chunksRef.current];
-      chunksRef.current = [];
+      if (!chunksRef.current.length) return;
+      const toSend = [...chunksRef.current]; chunksRef.current = [];
       processChunk(toSend, speaker);
     }, CHUNK_INTERVAL);
-
-    recorder.start(1000); // collect data every 1s, flush every 5s
+    recorder.start(1000);
     return recorder;
   }, [processChunk]);
 
   // ─── Start recording ─────────────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
-    setError('');
+    setError(''); setSkippedCount(0);
     setStatus('Requesting microphone…');
-
     try {
-      // 1. Mic stream — YOUR voice
-      const micStream = await navigator.mediaDevices.getUserMedia({
+      const mic = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
       });
-
+      setMicStream(mic);
       setStatus('Requesting system audio — select your Google Meet tab and enable "Share tab audio"…');
 
-      // 2. System audio — CLIENT's voice (tab/screen capture)
-      let sysStream: MediaStream | null = null;
+      let sys: MediaStream | null = null;
       try {
-        const displayStream = await navigator.mediaDevices.getDisplayMedia({
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          video: true as any,
-          audio: { echoCancellation: false, noiseSuppression: false, sampleRate: 16000 },
-        });
-        // Stop video track — we only want audio
-        displayStream.getVideoTracks().forEach((t) => t.stop());
-        sysStream = displayStream;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const display = await navigator.mediaDevices.getDisplayMedia({ video: true as any, audio: true });
+        display.getVideoTracks().forEach((t) => t.stop());
+        sys = display;
+        setSysStream(display);
       } catch {
-        // User cancelled screen share — continue with mic only
-        setStatus('⚠️ No system audio selected. Only your voice will be transcribed.');
+        setStatus('⚠️ No system audio — only your mic will be transcribed.');
       }
 
-      // 3. Start recorders
-      micRecorderRef.current = buildRecorder(micStream, micChunksRef, micIntervalRef, 'you');
-      if (sysStream && sysStream.getAudioTracks().length > 0) {
-        systemRecorderRef.current = buildRecorder(sysStream, sysChunksRef, sysIntervalRef, 'client');
-        setStatus('Recording — both voices active');
-      } else {
-        setStatus('Recording — your voice only');
+      micRecorderRef.current = buildRecorder(mic, micChunksRef, micIntervalRef, 'you');
+      if (sys?.getAudioTracks().length) {
+        systemRecorderRef.current = buildRecorder(sys, sysChunksRef, sysIntervalRef, 'client');
+        setStatus('');
       }
-
       setRecording(true);
     } catch (e) {
-      setError(`Could not start recording: ${String(e)}`);
-      setStatus('');
+      setError(`Could not start: ${String(e)}`); setStatus('');
     }
   }, [buildRecorder]);
 
   // ─── Stop recording ───────────────────────────────────────────────────────────
   const stopRecording = useCallback(() => {
-    [micIntervalRef, sysIntervalRef].forEach((ref) => { if (ref.current) clearInterval(ref.current); });
-
-    // Flush remaining chunks
+    [micIntervalRef, sysIntervalRef].forEach((r) => { if (r.current) clearInterval(r.current); });
     if (micChunksRef.current.length) processChunk([...micChunksRef.current], 'you');
     if (sysChunksRef.current.length) processChunk([...sysChunksRef.current], 'client');
-
     micRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
     systemRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
-    micRecorderRef.current?.stop();
-    systemRecorderRef.current?.stop();
-
-    micRecorderRef.current = null;
-    systemRecorderRef.current = null;
-    micChunksRef.current = [];
-    sysChunksRef.current = [];
-
-    setRecording(false);
-    setStatus('');
+    micRecorderRef.current?.stop(); systemRecorderRef.current?.stop();
+    micRecorderRef.current = null; systemRecorderRef.current = null;
+    micChunksRef.current = []; sysChunksRef.current = [];
+    setMicStream(null); setSysStream(null);
+    setRecording(false); setStatus('');
   }, [processChunk]);
 
-  // ─── Manual Q&A ──────────────────────────────────────────────────────────────
   const askManual = async () => {
     const q = manualInput.trim();
     if (!q) return;
@@ -238,13 +296,13 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     if (hasKB) getAiAnswer(entryId, q);
   };
 
-  const pending  = questions.filter((q) => !q.asked);
-  const askedQs  = questions.filter((q) => q.asked);
+  const pending = questions.filter((q) => !q.asked);
+  const askedQs = questions.filter((q) => q.asked);
 
   return (
-    <div className="flex flex-col gap-4" style={{ height: 'calc(100vh - 120px)' }}>
+    <div className="flex flex-col gap-3" style={{ height: 'calc(100vh - 120px)' }}>
 
-      {/* Controls */}
+      {/* Controls row */}
       <div className="flex items-center gap-3 flex-wrap">
         <button onClick={recording ? stopRecording : startRecording}
           className={`flex items-center gap-2 px-4 py-2 rounded-xl font-medium text-sm transition-all ${recording ? 'bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-900/40' : 'bg-slate-700 hover:bg-slate-600 text-slate-100'}`}>
@@ -253,31 +311,51 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
         </button>
 
         <select value={model} onChange={(e) => setModel(e.target.value)}
-          className="px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">
+          className="px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none">
           {GROQ_MODELS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
         </select>
 
         <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border ${hasKB ? 'border-green-800 bg-green-900/20 text-green-400' : 'border-slate-700 text-slate-500'}`}>
           <div className={`w-1.5 h-1.5 rounded-full ${hasKB ? 'bg-green-400' : 'bg-slate-500'}`} />
-          {hasKB ? 'Knowledge base loaded' : 'No knowledge base — add content in Prep tab'}
+          {hasKB ? 'Knowledge base loaded' : 'No knowledge base'}
         </div>
 
+        {skippedCount > 0 && (
+          <span className="text-xs text-slate-500">
+            {skippedCount} silence chunk{skippedCount !== 1 ? 's' : ''} skipped
+          </span>
+        )}
+
         {transcript.length > 0 && (
-          <button onClick={() => { if (confirm('Clear transcript?')) setTranscript([]); }}
+          <button onClick={() => { if (confirm('Clear transcript?')) { setTranscript([]); setSkippedCount(0); } }}
             className="ml-auto text-xs text-slate-500 hover:text-red-400 transition-colors">
             Clear transcript
           </button>
         )}
       </div>
 
-      {/* Status / how-to hint */}
-      {(status || !recording) && (
+      {/* Audio level meters — real-time VAD verification */}
+      {recording && (
+        <div className="px-4 py-3 rounded-xl bg-slate-800/60 border border-slate-700 space-y-2">
+          <p className="text-xs text-slate-400 font-medium mb-1">Audio levels — speech detected above the threshold line</p>
+          <LevelBar level={micLevel} label="You (mic)" color="#6366f1" />
+          <LevelBar level={sysLevel} label="Client (sys)" color="#10b981" />
+          <p className="text-xs text-slate-600 mt-1">
+            Chunks below the speech threshold are silently dropped to prevent Whisper hallucinations (e.g. "Thank you" on silence).
+          </p>
+        </div>
+      )}
+
+      {/* Status / instructions */}
+      {(error || status || !recording) && (
         <div className={`px-4 py-3 rounded-xl text-sm border ${error ? 'bg-red-900/30 border-red-700 text-red-300' : 'bg-slate-800/60 border-slate-700 text-slate-400'}`}>
           {error || status || (
             <span>
-              Press <strong className="text-slate-200">Start Recording</strong>. Allow mic access, then a screen-share dialog will appear —
-              select your <strong className="text-slate-200">Google Meet tab</strong> and check{' '}
-              <strong className="text-slate-200">"Share tab audio"</strong>. Your mic = <span className="text-indigo-400">You</span>, Meet audio = <span className="text-emerald-400">Client</span>.
+              Press <strong className="text-slate-200">Start Recording</strong>. Allow mic → then select your{' '}
+              <strong className="text-slate-200">Google Meet tab</strong> in the share dialog and tick{' '}
+              <strong className="text-slate-200">"Share tab audio"</strong>.
+              Your mic = <span className="text-indigo-400">You</span> · Meet audio = <span className="text-emerald-400">Client</span>.
+              Watch the audio meters to confirm both streams are active.
             </span>
           )}
         </div>
@@ -286,28 +364,26 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
       {/* Main area */}
       <div className="flex gap-4 flex-1 min-h-0">
 
-        {/* Transcript panel */}
+        {/* Transcript */}
         <div className="flex-1 flex flex-col gap-3 min-h-0">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Live Transcript</h3>
             <div className="flex items-center gap-3 text-xs text-slate-500">
               <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-indigo-500/60" />You (mic)</span>
-              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-emerald-500/60" />Client (system audio)</span>
-              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-amber-500/60" />Client question + AI answer</span>
+              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-emerald-500/60" />Client (system)</span>
+              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm bg-amber-500/60" />Client Q + AI answer</span>
             </div>
           </div>
 
           <div className="flex-1 overflow-y-auto scrollbar-thin space-y-3 pr-1 rounded-xl bg-slate-900/50 border border-slate-800 p-4">
             {transcript.length === 0 && (
               <div className="flex items-center justify-center h-full text-slate-600 text-sm text-center">
-                {recording ? (
-                  <span className="flex items-center gap-2">
-                    <span className="inline-flex gap-1">
-                      {[0,150,300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}
+                {recording
+                  ? <span className="flex items-center gap-2">
+                      <span className="inline-flex gap-1">{[0,150,300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}</span>
+                      Listening — transcript appears every ~5 seconds when speech is detected
                     </span>
-                    Listening — transcript will appear every ~5 seconds
-                  </span>
-                ) : 'Transcript will appear here once you start recording'}
+                  : 'Transcript will appear here once you start recording'}
               </div>
             )}
 
@@ -335,23 +411,19 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
                         )}
                       </div>
                     </div>
-
                     {(entry.aiAnswer !== undefined || entry.aiLoading) && (
                       <div className="mt-2 ml-2 pl-3 border-l-2 border-amber-600/40">
                         <p className="text-xs text-amber-500 font-medium mb-1">AI Answer</p>
-                        {entry.aiLoading && !entry.aiAnswer ? (
-                          <span className="flex items-center gap-1.5 text-slate-500 text-sm">
-                            <span className="inline-flex gap-1">
-                              {[0,150,300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-amber-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}
+                        {entry.aiLoading && !entry.aiAnswer
+                          ? <span className="flex items-center gap-1.5 text-slate-500 text-sm">
+                              <span className="inline-flex gap-1">{[0,150,300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-amber-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}</span>
+                              Looking up answer…
                             </span>
-                            Looking up answer…
-                          </span>
-                        ) : (
-                          <p className="text-sm text-slate-200 leading-relaxed">
-                            {entry.aiAnswer}
-                            {entry.aiLoading && <span className="inline-block w-1.5 h-4 bg-amber-400 ml-0.5 animate-pulse" />}
-                          </p>
-                        )}
+                          : <p className="text-sm text-slate-200 leading-relaxed">
+                              {entry.aiAnswer}
+                              {entry.aiLoading && <span className="inline-block w-1.5 h-4 bg-amber-400 ml-0.5 animate-pulse" />}
+                            </p>
+                        }
                       </div>
                     )}
                   </div>
@@ -361,7 +433,7 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
             <div ref={bottomRef} />
           </div>
 
-          {/* Manual input fallback */}
+          {/* Manual input */}
           <div className="space-y-1.5">
             <p className="text-xs text-slate-500">Manual — type a client question to look up instantly:</p>
             <div className="flex gap-2">
@@ -383,32 +455,30 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
           <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
             Your Questions{pending.length > 0 && <span className="ml-2 text-indigo-400">{pending.length} left</span>}
           </h3>
-
-          {questions.length === 0 ? (
-            <p className="text-xs text-slate-500">Add questions in the Prep tab</p>
-          ) : (
-            <div className="flex-1 overflow-y-auto scrollbar-thin space-y-1.5 min-h-0">
-              {pending.map((q) => (
-                <button key={q.id} onClick={() => onToggleQuestion(q.id)}
-                  className="w-full text-left px-3 py-2.5 rounded-lg bg-slate-800/70 border border-slate-700 hover:border-indigo-500/60 hover:bg-indigo-950/30 transition-colors group">
-                  <p className="text-xs text-slate-300 leading-relaxed">{q.text}</p>
-                  <p className="text-xs text-slate-600 mt-0.5 group-hover:text-indigo-400 transition-colors">Tap to mark asked</p>
-                </button>
-              ))}
-              {askedQs.length > 0 && (
-                <>
-                  <p className="text-xs text-slate-600 pt-2 pb-1 border-t border-slate-800 mt-2">Asked</p>
-                  {askedQs.map((q) => (
-                    <button key={q.id} onClick={() => onToggleQuestion(q.id)}
-                      className="w-full text-left px-3 py-2 rounded-lg bg-slate-800/20 border border-slate-700/30 hover:border-slate-600/50 transition-colors">
-                      <p className="text-xs text-slate-600 line-through leading-relaxed">{q.text}</p>
-                    </button>
-                  ))}
-                </>
-              )}
-            </div>
-          )}
-
+          {questions.length === 0
+            ? <p className="text-xs text-slate-500">Add questions in the Prep tab</p>
+            : (
+              <div className="flex-1 overflow-y-auto scrollbar-thin space-y-1.5 min-h-0">
+                {pending.map((q) => (
+                  <button key={q.id} onClick={() => onToggleQuestion(q.id)}
+                    className="w-full text-left px-3 py-2.5 rounded-lg bg-slate-800/70 border border-slate-700 hover:border-indigo-500/60 hover:bg-indigo-950/30 transition-colors group">
+                    <p className="text-xs text-slate-300 leading-relaxed">{q.text}</p>
+                    <p className="text-xs text-slate-600 mt-0.5 group-hover:text-indigo-400">Tap to mark asked</p>
+                  </button>
+                ))}
+                {askedQs.length > 0 && (
+                  <>
+                    <p className="text-xs text-slate-600 pt-2 pb-1 border-t border-slate-800 mt-2">Asked</p>
+                    {askedQs.map((q) => (
+                      <button key={q.id} onClick={() => onToggleQuestion(q.id)}
+                        className="w-full text-left px-3 py-2 rounded-lg bg-slate-800/20 border border-slate-700/30 transition-colors">
+                        <p className="text-xs text-slate-600 line-through leading-relaxed">{q.text}</p>
+                      </button>
+                    ))}
+                  </>
+                )}
+              </div>
+            )}
           {questions.length > 0 && (
             <div className="space-y-1 flex-shrink-0">
               <div className="flex justify-between text-xs text-slate-600">
