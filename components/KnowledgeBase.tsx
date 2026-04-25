@@ -46,24 +46,39 @@ export default function KnowledgeBase({ sources, onAdd, onRemove, onClear }: Pro
         body: JSON.stringify({ url: urlInput.trim(), maxPages }),
       });
       const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
+      // Use { stream: true } so multi-byte chars spanning chunks decode correctly
+      const decoder = new TextDecoder('utf-8', { fatal: false });
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const lines = decoder.decode(value).split('\n').filter((l) => l.startsWith('data: '));
-        for (const line of lines) {
-          const data = JSON.parse(line.slice(6));
-          if (data.type === 'progress') {
-            setCrawlLog((p) => [...p.slice(-30), `[${data.crawled}/${data.total}] ${data.currentUrl}`]);
-          } else if (data.type === 'page') {
-            // Each page arrives as its own event — no giant JSON payload
-            onAdd({ id: `${Date.now()}-${Math.random()}`, label: data.url, content: data.text, addedAt: new Date().toISOString() });
-          } else if (data.type === 'done') {
-            setCrawlLog((p) => [...p, `✓ Done — ${data.pagesAdded} pages added`]);
-            setUrlInput('');
-          } else if (data.type === 'error') {
-            setCrawlLog((p) => [...p, `Error: ${data.message}`]);
+
+        // Accumulate into buffer — DO NOT split yet, a single TCP packet may
+        // contain partial SSE events when payloads are large (e.g. page content).
+        buffer += decoder.decode(value, { stream: true });
+
+        // Split on the SSE event delimiter \n\n; keep any incomplete tail
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() ?? '';   // last element may be incomplete — save for next chunk
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.type === 'progress') {
+              setCrawlLog((p) => [...p.slice(-30), `[${data.crawled}/${data.total}] ${data.currentUrl}`]);
+            } else if (data.type === 'page') {
+              onAdd({ id: `${Date.now()}-${Math.random()}`, label: data.url, content: data.text, addedAt: new Date().toISOString() });
+            } else if (data.type === 'done') {
+              setCrawlLog((p) => [...p, `✓ Done — ${data.pagesAdded} pages added`]);
+              setUrlInput('');
+            } else if (data.type === 'error') {
+              setCrawlLog((p) => [...p, `Error: ${data.message}`]);
+            }
+          } catch {
+            // Skip any single malformed event — don't crash the whole crawl
           }
         }
       }

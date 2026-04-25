@@ -28,8 +28,8 @@ export async function POST(req: NextRequest) {
           send({
             type: 'page',
             url: result.url,
-            // Truncate per-page text to 50KB to keep events manageable
-            text: result.text.slice(0, 50000),
+            // Truncate per-page text to 20KB — keeps each SSE event well under TCP MTU
+            text: result.text.slice(0, 20000),
           });
         }
 
