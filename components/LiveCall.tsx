@@ -32,9 +32,12 @@ const GROQ_MODELS = [
 ];
 
 const CHUNK_INTERVAL = 5000;      // ms between transcription sends
-// Peak level threshold (0–255 from AnalyserNode getByteFrequencyData).
-// Silence ≈ 0–5, background noise ≈ 5–15, speech ≈ 15–80+
-const SPEECH_THRESHOLD = 12;
+// VAD threshold — applied to the *peak* (max) frequency bin (0–255).
+// Using max instead of average gives real speech values of 40–200+.
+// Silence ≈ 0–10, background noise ≈ 10–25, speech ≈ 30+
+// Set very low (8) so we only skip truly silent chunks; Whisper + hallucination
+// filter handles the rest.
+const SPEECH_THRESHOLD = 8;
 const HALLUCINATIONS = new Set([  // known Whisper noise hallucinations to silently drop
   'thank you', 'thanks', 'thank you.', 'thanks.', 'you', 'the',
   'thanks for watching', 'thank you for watching', 'bye', 'bye.',
@@ -42,26 +45,30 @@ const HALLUCINATIONS = new Set([  // known Whisper noise hallucinations to silen
 ]);
 
 // ─── Live level meter using AnalyserNode ────────────────────────────────────
-// Also exposes a peakRef so the recorder can check if speech occurred in a
-// chunk interval WITHOUT needing to decode the WebM blob (unreliable).
+// Uses the PEAK (max) frequency bin, not the average.
+// Average ≈ very low (all silent bins drag it down); max ≈ 40–200 for speech.
+// peakRef accumulates the highest peak seen in the current chunk interval.
 function useLevelMeter(stream: MediaStream | null) {
   const [level, setLevel] = useState(0);
-  const peakRef = useRef(0);   // tracks highest avg level seen since last reset
+  const peakRef = useRef(0);   // highest peak bin seen since last reset
   const rafRef  = useRef<number>(0);
 
   useEffect(() => {
     if (!stream) { setLevel(0); peakRef.current = 0; return; }
     const ctx      = new AudioContext();
+    ctx.resume();                 // ensure context isn't suspended (browser policy)
     const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
+    analyser.fftSize = 512;       // higher resolution
     ctx.createMediaStreamSource(stream).connect(analyser);
     const data = new Uint8Array(analyser.frequencyBinCount);
 
     const tick = () => {
       analyser.getByteFrequencyData(data);
-      const avg = data.reduce((a, b) => a + b, 0) / data.length;
-      setLevel(avg);
-      if (avg > peakRef.current) peakRef.current = avg;
+      // Use peak bin instead of average — speech shows up as strong peaks in speech-frequency bins
+      let peak = 0;
+      for (let i = 0; i < data.length; i++) if (data[i] > peak) peak = data[i];
+      setLevel(peak);
+      if (peak > peakRef.current) peakRef.current = peak;
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -74,7 +81,7 @@ function useLevelMeter(stream: MediaStream | null) {
 
 // ─── Level bar component ─────────────────────────────────────────────────────
 function LevelBar({ level, label, color }: { level: number; label: string; color: string }) {
-  const pct = Math.min(100, (level / 60) * 100);
+  const pct = Math.min(100, (level / 255) * 100);   // 0–255 peak scale
   const isActive = level > SPEECH_THRESHOLD;
   return (
     <div className="flex items-center gap-2 min-w-0">
@@ -83,8 +90,8 @@ function LevelBar({ level, label, color }: { level: number; label: string; color
         <div className="h-full rounded-full transition-all duration-75"
           style={{ width: `${pct}%`, background: isActive ? color : '#334155' }} />
       </div>
-      <span className={`text-xs w-12 flex-shrink-0 ${isActive ? 'text-slate-300' : 'text-slate-600'}`}>
-        {isActive ? 'Speech' : 'Silence'}
+      <span className={`text-xs w-20 flex-shrink-0 font-mono ${isActive ? 'text-slate-300' : 'text-slate-600'}`}>
+        {Math.round(level)} {isActive ? '✓ speech' : '— quiet'}
       </span>
     </div>
   );
@@ -167,7 +174,7 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
   const processChunk = useCallback(async (chunks: Blob[], speaker: Speaker, peakLevel: number) => {
     if (!chunks.length) return;
     const blob = new Blob(chunks, { type: 'audio/webm' });
-    if (blob.size < 500) return;
+    if (blob.size < 200) return;   // truly empty blob — skip
 
     // ── Voice Activity Detection via AnalyserNode peak ────────────────────────
     if (peakLevel < SPEECH_THRESHOLD) {
@@ -204,6 +211,12 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
   }, [hasKB, getAiAnswer, tryMatchChecklist]);
 
   // ─── Build MediaRecorder ─────────────────────────────────────────────────────
+  // IMPORTANT: MediaRecorder.start(timeslice) puts the WebM init segment
+  // (EBML header + Tracks) ONLY in the very first ondataavailable chunk.
+  // Subsequent chunks are raw Cluster elements that CANNOT be decoded on their
+  // own — Whisper (and any decoder) will fail silently on them.
+  // Fix: save the first chunk as an "init segment" and prepend it to every
+  // subsequent batch so each upload is a valid, self-contained WebM file.
   const buildRecorder = useCallback((
     stream: MediaStream,
     chunksRef: React.MutableRefObject<Blob[]>,
@@ -214,14 +227,31 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
     const recorder = new MediaRecorder(stream, { mimeType });
     chunksRef.current = [];
-    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+
+    let initChunk: Blob | null = null;   // WebM initialization segment
+    let batchNum = 0;                    // which flush interval are we on
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) {
+        if (!initChunk) initChunk = e.data;   // first chunk = init segment, save it
+        chunksRef.current.push(e.data);
+      }
+    };
+
     intervalRef.current = setInterval(() => {
       if (!chunksRef.current.length) return;
-      const toSend   = [...chunksRef.current]; chunksRef.current = [];
-      const peak     = peakRef.current;
-      peakRef.current = 0;  // reset for next interval
-      processChunk(toSend, speaker, peak);
+      const toSend = [...chunksRef.current]; chunksRef.current = [];
+      batchNum++;
+
+      // Batch 1: already contains the init segment as its first element.
+      // Batch 2+: prepend saved init segment so Whisper gets a valid WebM.
+      const blobChunks = (batchNum > 1 && initChunk) ? [initChunk, ...toSend] : toSend;
+
+      const peak = peakRef.current;
+      peakRef.current = 0;   // reset peak accumulator for next interval
+      processChunk(blobChunks, speaker, peak);
     }, CHUNK_INTERVAL);
+
     recorder.start(1000);
     return recorder;
   }, [processChunk]);
@@ -323,11 +353,11 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
       {/* Audio level meters — real-time VAD verification */}
       {recording && (
         <div className="px-4 py-3 rounded-xl bg-slate-800/60 border border-slate-700 space-y-2">
-          <p className="text-xs text-slate-400 font-medium mb-1">Audio levels — speech detected above the threshold line</p>
+          <p className="text-xs text-slate-400 font-medium mb-1">Audio levels (0–255 peak) — anything above {SPEECH_THRESHOLD} is sent to transcription</p>
           <LevelBar level={micLevel} label="You (mic)" color="#6366f1" />
           <LevelBar level={sysLevel} label="Client (sys)" color="#10b981" />
           <p className="text-xs text-slate-600 mt-1">
-            Chunks below the speech threshold are silently dropped to prevent Whisper hallucinations (e.g. "Thank you" on silence).
+            Peak &lt; {SPEECH_THRESHOLD} = skipped (silence). Peak ≥ {SPEECH_THRESHOLD} = sent to Whisper every 5 s.
           </p>
         </div>
       )}
