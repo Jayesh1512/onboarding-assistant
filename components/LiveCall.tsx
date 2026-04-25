@@ -31,61 +31,45 @@ const GROQ_MODELS = [
   { value: 'mixtral-8x7b-32768',      label: 'Mixtral 8x7B' },
 ];
 
-const CHUNK_INTERVAL = 5000;        // ms between transcription sends
-const SPEECH_THRESHOLD = 8;         // 0–255 RMS level — below this = silence/noise, skip Whisper
-const HALLUCINATIONS = new Set([    // known Whisper noise hallucinations to silently drop
+const CHUNK_INTERVAL = 5000;      // ms between transcription sends
+// Peak level threshold (0–255 from AnalyserNode getByteFrequencyData).
+// Silence ≈ 0–5, background noise ≈ 5–15, speech ≈ 15–80+
+const SPEECH_THRESHOLD = 12;
+const HALLUCINATIONS = new Set([  // known Whisper noise hallucinations to silently drop
   'thank you', 'thanks', 'thank you.', 'thanks.', 'you', 'the',
   'thanks for watching', 'thank you for watching', 'bye', 'bye.',
   'please subscribe', 'like and subscribe', '...', '. . .',
 ]);
 
-// ─── Measure RMS audio level of a Blob (0–255) ──────────────────────────────
-async function measureRMS(blob: Blob): Promise<number> {
-  try {
-    const arrayBuffer = await blob.arrayBuffer();
-    const audioCtx = new AudioContext();
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    const data = audioBuffer.getChannelData(0);
-    const rms = Math.sqrt(data.reduce((sum, v) => sum + v * v, 0) / data.length);
-    audioCtx.close();
-    return rms * 255; // scale to 0–255
-  } catch {
-    return 0;
-  }
-}
-
 // ─── Live level meter using AnalyserNode ────────────────────────────────────
+// Also exposes a peakRef so the recorder can check if speech occurred in a
+// chunk interval WITHOUT needing to decode the WebM blob (unreliable).
 function useLevelMeter(stream: MediaStream | null) {
   const [level, setLevel] = useState(0);
-  const rafRef = useRef<number>(0);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const ctxRef = useRef<AudioContext | null>(null);
+  const peakRef = useRef(0);   // tracks highest avg level seen since last reset
+  const rafRef  = useRef<number>(0);
 
   useEffect(() => {
-    if (!stream) { setLevel(0); return; }
-    const ctx = new AudioContext();
+    if (!stream) { setLevel(0); peakRef.current = 0; return; }
+    const ctx      = new AudioContext();
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
     ctx.createMediaStreamSource(stream).connect(analyser);
-    ctxRef.current = ctx;
-    analyserRef.current = analyser;
     const data = new Uint8Array(analyser.frequencyBinCount);
 
     const tick = () => {
       analyser.getByteFrequencyData(data);
       const avg = data.reduce((a, b) => a + b, 0) / data.length;
       setLevel(avg);
+      if (avg > peakRef.current) peakRef.current = avg;
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
 
-    return () => {
-      cancelAnimationFrame(rafRef.current);
-      ctx.close();
-    };
+    return () => { cancelAnimationFrame(rafRef.current); ctx.close(); };
   }, [stream]);
 
-  return level;
+  return { level, peakRef };
 }
 
 // ─── Level bar component ─────────────────────────────────────────────────────
@@ -126,9 +110,9 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
   const bottomRef         = useRef<HTMLDivElement>(null);
   const hasKB             = context.length > 0;
 
-  // Live level meters
-  const micLevel = useLevelMeter(micStream);
-  const sysLevel = useLevelMeter(sysStream);
+  // Live level meters — also expose peakRef for VAD gating
+  const { level: micLevel, peakRef: micPeakRef } = useLevelMeter(micStream);
+  const { level: sysLevel, peakRef: sysPeakRef } = useLevelMeter(sysStream);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [transcript]);
 
@@ -179,15 +163,14 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
   }, [questions, onToggleQuestion]);
 
   // ─── Process audio chunk with VAD ────────────────────────────────────────────
-  const processChunk = useCallback(async (chunks: Blob[], speaker: Speaker) => {
+  // peakLevel comes from the AnalyserNode tick (already running) — no blob decoding needed
+  const processChunk = useCallback(async (chunks: Blob[], speaker: Speaker, peakLevel: number) => {
     if (!chunks.length) return;
     const blob = new Blob(chunks, { type: 'audio/webm' });
     if (blob.size < 500) return;
 
-    // ── Voice Activity Detection ──────────────────────────────────────────────
-    const rms = await measureRMS(blob);
-    if (rms < SPEECH_THRESHOLD) {
-      // Audio level too low — skip Whisper to avoid hallucinations
+    // ── Voice Activity Detection via AnalyserNode peak ────────────────────────
+    if (peakLevel < SPEECH_THRESHOLD) {
       setSkippedCount((n) => n + 1);
       return;
     }
@@ -226,6 +209,7 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     chunksRef: React.MutableRefObject<Blob[]>,
     intervalRef: React.MutableRefObject<ReturnType<typeof setInterval> | null>,
     speaker: Speaker,
+    peakRef: React.MutableRefObject<number>,
   ) => {
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
     const recorder = new MediaRecorder(stream, { mimeType });
@@ -233,8 +217,10 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
     intervalRef.current = setInterval(() => {
       if (!chunksRef.current.length) return;
-      const toSend = [...chunksRef.current]; chunksRef.current = [];
-      processChunk(toSend, speaker);
+      const toSend   = [...chunksRef.current]; chunksRef.current = [];
+      const peak     = peakRef.current;
+      peakRef.current = 0;  // reset for next interval
+      processChunk(toSend, speaker, peak);
     }, CHUNK_INTERVAL);
     recorder.start(1000);
     return recorder;
@@ -262,9 +248,9 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
         setStatus('⚠️ No system audio — only your mic will be transcribed.');
       }
 
-      micRecorderRef.current = buildRecorder(mic, micChunksRef, micIntervalRef, 'you');
+      micRecorderRef.current = buildRecorder(mic, micChunksRef, micIntervalRef, 'you', micPeakRef);
       if (sys?.getAudioTracks().length) {
-        systemRecorderRef.current = buildRecorder(sys, sysChunksRef, sysIntervalRef, 'client');
+        systemRecorderRef.current = buildRecorder(sys, sysChunksRef, sysIntervalRef, 'client', sysPeakRef);
         setStatus('');
       }
       setRecording(true);
@@ -276,8 +262,8 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
   // ─── Stop recording ───────────────────────────────────────────────────────────
   const stopRecording = useCallback(() => {
     [micIntervalRef, sysIntervalRef].forEach((r) => { if (r.current) clearInterval(r.current); });
-    if (micChunksRef.current.length) processChunk([...micChunksRef.current], 'you');
-    if (sysChunksRef.current.length) processChunk([...sysChunksRef.current], 'client');
+    if (micChunksRef.current.length) processChunk([...micChunksRef.current], 'you', micPeakRef.current);
+    if (sysChunksRef.current.length) processChunk([...sysChunksRef.current], 'client', sysPeakRef.current);
     micRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
     systemRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
     micRecorderRef.current?.stop(); systemRecorderRef.current?.stop();
