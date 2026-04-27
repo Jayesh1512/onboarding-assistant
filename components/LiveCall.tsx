@@ -203,8 +203,12 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
           ? { ...e, answeredQuestionId: answeredId! } : e));
       }
 
-      // Client is asking about the company → pull answer from KB
-      if (analysis.isCompanyQuestion && hasKB) {
+      // Client is asking about the company → pull answer from KB.
+      // Don't rely solely on LLM classification — if the client utterance looks like a question
+      // (detected locally) and we have a KB, always look it up. The KB answer prompt will say
+      // "I don't have that info" if it's not in the KB, so false positives are harmless.
+      const clientAskedQuestion = speaker === 'client' && isLikelyQuestion(text);
+      if (hasKB && clientAskedQuestion) {
         getAiAnswer(entryId, text);
       }
     } catch { /* never crash the call */ }
