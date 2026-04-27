@@ -27,6 +27,19 @@ interface Props {
 const QUESTION_STARTERS = /^(what|how|why|when|where|who|which|is|are|do|does|can|could|would|will|should|have|has|did|tell me|explain|describe)/i;
 const isLikelyQuestion = (t: string) => t.trim().endsWith('?') || QUESTION_STARTERS.test(t.trim());
 
+// Fallback fuzzy matcher — used if the LLM misses a match.
+// Tokenises both strings, removes stop words, measures word overlap.
+const STOP = new Set(['a','an','the','is','are','do','does','your','my','our','you','we','i','it','in','of','to','for','and','or','what','how','where','when','who','which','that','this','have','has','did','can','could','would','will','be','been','with','at','by','from','on','as']);
+function fuzzyMatch(spoken: string, prepared: string): boolean {
+  const tok = (s: string) =>
+    s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w));
+  const a = new Set(tok(spoken));
+  const b = tok(prepared);
+  if (!a.size || !b.length) return false;
+  const overlap = b.filter((w) => a.has(w)).length;
+  return overlap / b.length >= 0.4;   // 40% of prepared-question keywords must appear
+}
+
 const GEMINI_MODELS = [
   { value: 'gemini-2.0-flash',      label: 'Gemini 2.0 Flash (fast)' },
   { value: 'gemini-2.5-pro',        label: 'Gemini 2.5 Pro (smart)' },
@@ -163,19 +176,31 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
       const analysis = await res.json();
 
       // User asked a prepared question → mark it asked, remember we're awaiting client answer
-      if (analysis.matchedPreparedQuestionId) {
-        onToggleQuestion(analysis.matchedPreparedQuestionId);
-        lastAskedQuestionIdRef.current = analysis.matchedPreparedQuestionId;
+      // If LLM missed it, fall back to local fuzzy matching
+      let matchedId: string | null = analysis.matchedPreparedQuestionId ?? null;
+      if (!matchedId && speaker === 'you') {
+        const pending = questionsRef.current.filter((q) => !q.asked);
+        const found = pending.find((q) => fuzzyMatch(text, q.text));
+        if (found) matchedId = found.id;
+      }
+      if (matchedId) {
+        onToggleQuestion(matchedId);
+        lastAskedQuestionIdRef.current = matchedId;
         setTranscript((p) => p.map((e) => e.id === entryId
-          ? { ...e, matchedQuestionId: analysis.matchedPreparedQuestionId } : e));
+          ? { ...e, matchedQuestionId: matchedId! } : e));
       }
 
-      // Client answered a prepared question → store the answer
-      if (analysis.clientAnswerForId) {
-        onAnswerQuestion(analysis.clientAnswerForId, text);
+      // Client answered a prepared question → store the answer.
+      // Fallback: if LLM missed it but we know a question is awaiting an answer, capture it anyway.
+      let answeredId: string | null = analysis.clientAnswerForId ?? null;
+      if (!answeredId && speaker === 'client' && lastAskedQuestionIdRef.current) {
+        answeredId = lastAskedQuestionIdRef.current;
+      }
+      if (answeredId) {
+        onAnswerQuestion(answeredId, text);
         lastAskedQuestionIdRef.current = null;
         setTranscript((p) => p.map((e) => e.id === entryId
-          ? { ...e, answeredQuestionId: analysis.clientAnswerForId } : e));
+          ? { ...e, answeredQuestionId: answeredId! } : e));
       }
 
       // Client is asking about the company → pull answer from KB

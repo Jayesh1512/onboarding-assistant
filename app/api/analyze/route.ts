@@ -3,13 +3,27 @@ export const dynamic = 'force-dynamic';
 import { NextRequest } from 'next/server';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-const SYSTEM = `You analyze a live sales/onboarding call in real time.
-Given the latest utterance, recent context, and prepared questions, return ONLY a JSON object with:
-- "matchedPreparedQuestionId": string|null — if the "you" speaker just asked one of the prepared questions (semantically), return its id; else null
-- "clientAnswerForId": string|null — if the "client" speaker is directly answering the last-asked prepared question, return that question's id; else null
-- "isCompanyQuestion": boolean — true ONLY if the "client" speaker is asking about the company, product, or service
+const SYSTEM = `You are analyzing a live sales/onboarding call transcript in real time.
 
-Be strict — only match on clear semantic alignment. Return ONLY valid JSON, no explanation.`;
+Your job: classify the LATEST utterance by looking at the recent conversation and a list of prepared questions.
+
+Return ONLY a JSON object — no explanation, no markdown, just raw JSON — with these fields:
+
+"matchedPreparedQuestionId": string | null
+  → If the speaker is "you" and they just asked something that SEMANTICALLY MATCHES any prepared question, return that question's id.
+  → Use FUZZY / SEMANTIC matching — minor wording differences, singular vs plural, paraphrasing, reordering all count as a match.
+  → Example: "Where is your HQ?" matches "Where is your headquarter located?"
+  → Example: "How many drones do you operate?" matches "How many docks does your company use?"
+  → If speaker is "client", always return null here.
+
+"clientAnswerForId": string | null
+  → If the speaker is "client" AND there is a recently-asked prepared question (provided as lastAskedQuestionId), return that question's id to indicate this is the client's answer.
+  → Even partial answers count — e.g. "So we are located in Maharashtra" answers "Where is your headquarters located?"
+  → If lastAskedQuestionId is "none" or speaker is "you", return null.
+
+"isCompanyQuestion": boolean
+  → true ONLY if speaker is "client" and they are asking a specific question about the other party's company, product, pricing, or service.
+  → false for everything else (greetings, answers, statements, filler).`;
 
 export async function POST(req: NextRequest) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -25,18 +39,23 @@ export async function POST(req: NextRequest) {
     : '  (none)';
 
   const userMsg =
-    `Latest utterance: [${latestEntry.speaker}] "${latestEntry.text}"\n\n` +
-    `Recent context:\n${contextStr}\n\n` +
-    `Prepared questions not yet asked:\n${questionsStr}\n\n` +
-    `Last prepared question asked (awaiting client answer): ${lastAskedQuestionId ?? 'none'}\n` +
-    `Knowledge base available: ${hasKB}`;
+    `LATEST UTTERANCE: [${latestEntry.speaker}] "${latestEntry.text}"\n\n` +
+    `RECENT CONVERSATION (for context):\n${contextStr}\n\n` +
+    `PREPARED QUESTIONS NOT YET ASKED:\n${questionsStr}\n\n` +
+    `LAST PREPARED QUESTION ASKED (awaiting client answer): ${lastAskedQuestionId ?? 'none'}\n` +
+    `Knowledge base available: ${hasKB}\n\n` +
+    `Remember: use fuzzy/semantic matching for questions. Return ONLY raw JSON.`;
 
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const gemini = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash-lite',   // fastest for real-time classification
+      model: 'gemini-2.0-flash',   // upgraded from flash-lite for better semantic matching
       systemInstruction: SYSTEM,
-      generationConfig: { responseMimeType: 'application/json', temperature: 0, maxOutputTokens: 120 },
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0,
+        maxOutputTokens: 150,
+      },
     });
 
     const result = await gemini.generateContent(userMsg);
@@ -50,6 +69,7 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     console.error('Analyze error:', err);
+    // Never crash the call — return safe defaults
     return Response.json({ matchedPreparedQuestionId: null, clientAnswerForId: null, isCompanyQuestion: false });
   }
 }
