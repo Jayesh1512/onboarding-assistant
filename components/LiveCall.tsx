@@ -31,58 +31,38 @@ const GROQ_MODELS = [
   { value: 'mixtral-8x7b-32768',      label: 'Mixtral 8x7B' },
 ];
 
-const CHUNK_INTERVAL = 2000;      // ms between transcription sends (low latency)
-// VAD threshold — applied to the *peak* (max) frequency bin (0–255).
-// Using max instead of average gives real speech values of 40–200+.
-// Silence ≈ 0–10, background noise ≈ 10–25, speech ≈ 30+
-// Set very low (8) so we only skip truly silent chunks; Whisper + hallucination
-// filter handles the rest.
-const SPEECH_THRESHOLD = 8;
-const HALLUCINATIONS = new Set([  // known Whisper noise hallucinations to silently drop
-  'thank you', 'thanks', 'thank you.', 'thanks.', 'you', 'the',
-  'thanks for watching', 'thank you for watching', 'bye', 'bye.',
-  'please subscribe', 'like and subscribe', '...', '. . .',
-]);
-
-// ─── Live level meter using AnalyserNode ────────────────────────────────────
-// Uses the PEAK (max) frequency bin, not the average.
-// Average ≈ very low (all silent bins drag it down); max ≈ 40–200 for speech.
-// peakRef accumulates the highest peak seen in the current chunk interval.
+// ─── Live level meter (visual only — VAD is handled by Deepgram endpointing) ──
 function useLevelMeter(stream: MediaStream | null) {
   const [level, setLevel] = useState(0);
-  const peakRef = useRef(0);   // highest peak bin seen since last reset
-  const rafRef  = useRef<number>(0);
+  const rafRef = useRef<number>(0);
 
   useEffect(() => {
-    if (!stream) { setLevel(0); peakRef.current = 0; return; }
-    const ctx      = new AudioContext();
-    ctx.resume();                 // ensure context isn't suspended (browser policy)
+    if (!stream) { setLevel(0); return; }
+    const ctx = new AudioContext();
+    ctx.resume();
     const analyser = ctx.createAnalyser();
-    analyser.fftSize = 512;       // higher resolution
+    analyser.fftSize = 512;
     ctx.createMediaStreamSource(stream).connect(analyser);
     const data = new Uint8Array(analyser.frequencyBinCount);
 
     const tick = () => {
       analyser.getByteFrequencyData(data);
-      // Use peak bin instead of average — speech shows up as strong peaks in speech-frequency bins
       let peak = 0;
       for (let i = 0; i < data.length; i++) if (data[i] > peak) peak = data[i];
       setLevel(peak);
-      if (peak > peakRef.current) peakRef.current = peak;
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
-
     return () => { cancelAnimationFrame(rafRef.current); ctx.close(); };
   }, [stream]);
 
-  return { level, peakRef };
+  return level;
 }
 
-// ─── Level bar component ─────────────────────────────────────────────────────
+// ─── Level bar ───────────────────────────────────────────────────────────────
 function LevelBar({ level, label, color }: { level: number; label: string; color: string }) {
-  const pct = Math.min(100, (level / 255) * 100);   // 0–255 peak scale
-  const isActive = level > SPEECH_THRESHOLD;
+  const pct = Math.min(100, (level / 255) * 100);
+  const isActive = level > 15;
   return (
     <div className="flex items-center gap-2 min-w-0">
       <span className="text-xs text-slate-500 w-14 flex-shrink-0">{label}</span>
@@ -91,39 +71,41 @@ function LevelBar({ level, label, color }: { level: number; label: string; color
           style={{ width: `${pct}%`, background: isActive ? color : '#334155' }} />
       </div>
       <span className={`text-xs w-20 flex-shrink-0 font-mono ${isActive ? 'text-slate-300' : 'text-slate-600'}`}>
-        {Math.round(level)} {isActive ? '✓ speech' : '— quiet'}
+        {Math.round(level)} {isActive ? '✓' : '—'}
       </span>
     </div>
   );
 }
 
 export default function LiveCall({ questions, context, onToggleQuestion }: Props) {
-  const [recording, setRecording]       = useState(false);
-  const [transcript, setTranscript]     = useState<TranscriptEntry[]>([]);
-  const [model, setModel]               = useState('llama-3.1-8b-instant');
-  const [manualInput, setManualInput]   = useState('');
-  const [status, setStatus]             = useState('');
-  const [error, setError]               = useState('');
-  const [micStream, setMicStream]       = useState<MediaStream | null>(null);
-  const [sysStream, setSysStream]       = useState<MediaStream | null>(null);
-  const [skippedCount, setSkippedCount] = useState(0); // silence skips counter
+  const [recording, setRecording]     = useState(false);
+  const [transcript, setTranscript]   = useState<TranscriptEntry[]>([]);
+  const [model, setModel]             = useState('llama-3.1-8b-instant');
+  const [manualInput, setManualInput] = useState('');
+  const [status, setStatus]           = useState('');
+  const [error, setError]             = useState('');
+  const [micStream, setMicStream]     = useState<MediaStream | null>(null);
+  const [sysStream, setSysStream]     = useState<MediaStream | null>(null);
 
-  const micRecorderRef    = useRef<MediaRecorder | null>(null);
-  const systemRecorderRef = useRef<MediaRecorder | null>(null);
-  const micChunksRef      = useRef<Blob[]>([]);
-  const sysChunksRef      = useRef<Blob[]>([]);
-  const micIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
-  const sysIntervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
-  const bottomRef         = useRef<HTMLDivElement>(null);
-  const hasKB             = context.length > 0;
+  // Interim (live) text while Deepgram is still listening to an utterance
+  const [liveYou, setLiveYou]         = useState('');
+  const [liveClient, setLiveClient]   = useState('');
 
-  // Live level meters — also expose peakRef for VAD gating
-  const { level: micLevel, peakRef: micPeakRef } = useLevelMeter(micStream);
-  const { level: sysLevel, peakRef: sysPeakRef } = useLevelMeter(sysStream);
+  const micWsRef      = useRef<WebSocket | null>(null);
+  const sysWsRef      = useRef<WebSocket | null>(null);
+  const micRecRef     = useRef<MediaRecorder | null>(null);
+  const sysRecRef     = useRef<MediaRecorder | null>(null);
+  const bottomRef     = useRef<HTMLDivElement>(null);
+  const hasKB         = context.length > 0;
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [transcript]);
+  const micLevel = useLevelMeter(micStream);
+  const sysLevel = useLevelMeter(sysStream);
 
-  // ─── AI answer ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [transcript, liveYou, liveClient]);
+
+  // ─── AI answer ─────────────────────────────────────────────────────────────
   const getAiAnswer = useCallback(async (entryId: string, question: string) => {
     setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, aiLoading: true, aiAnswer: '' } : e));
     try {
@@ -156,7 +138,7 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     }
   }, [model, context]);
 
-  // ─── Checklist match ─────────────────────────────────────────────────────────
+  // ─── Checklist match ────────────────────────────────────────────────────────
   const tryMatchChecklist = useCallback(async (spoken: string): Promise<string | null> => {
     try {
       const res = await fetch('/api/match-question', {
@@ -169,140 +151,148 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     return null;
   }, [questions, onToggleQuestion]);
 
-  // ─── Process audio chunk with VAD ────────────────────────────────────────────
-  // peakLevel comes from the AnalyserNode tick (already running) — no blob decoding needed
-  const processChunk = useCallback(async (chunks: Blob[], speaker: Speaker, peakLevel: number) => {
-    if (!chunks.length) return;
-    const blob = new Blob(chunks, { type: 'audio/webm' });
-    if (blob.size < 200) return;   // truly empty blob — skip
+  // ─── Handle final transcript from Deepgram ─────────────────────────────────
+  const handleFinal = useCallback(async (text: string, speaker: Speaker) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const entryId = `${Date.now()}-${speaker}`;
+    const isQuestion = isLikelyQuestion(trimmed);
+    setTranscript((p) => [...p, { id: entryId, speaker, text: trimmed, isQuestion }]);
 
-    // ── Voice Activity Detection via AnalyserNode peak ────────────────────────
-    if (peakLevel < SPEECH_THRESHOLD) {
-      setSkippedCount((n) => n + 1);
-      return;
+    if (speaker === 'client' && isQuestion && hasKB) {
+      getAiAnswer(entryId, trimmed);
+    } else if (speaker === 'you') {
+      const matchId = await tryMatchChecklist(trimmed);
+      if (matchId) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, matchedQuestionId: matchId } : e));
     }
-
-    const fd = new FormData();
-    fd.append('audio', blob, 'audio.webm');
-    fd.append('speaker', speaker);
-
-    try {
-      const res = await fetch('/api/transcribe', { method: 'POST', body: fd });
-      const { text } = await res.json() as { text: string };
-      if (!text?.trim()) return;
-
-      // ── Drop known Whisper hallucinations ────────────────────────────────────
-      if (HALLUCINATIONS.has(text.trim().toLowerCase())) {
-        setSkippedCount((n) => n + 1);
-        return;
-      }
-
-      const entryId = `${Date.now()}-${speaker}`;
-      const isQuestion = isLikelyQuestion(text);
-      setTranscript((p) => [...p, { id: entryId, speaker, text: text.trim(), isQuestion }]);
-
-      if (speaker === 'client' && isQuestion && hasKB) {
-        getAiAnswer(entryId, text.trim());
-      } else if (speaker === 'you') {
-        const matchId = await tryMatchChecklist(text.trim());
-        if (matchId) setTranscript((p) => p.map((e) => e.id === entryId ? { ...e, matchedQuestionId: matchId } : e));
-      }
-    } catch { /* ignore single bad chunk */ }
   }, [hasKB, getAiAnswer, tryMatchChecklist]);
 
-  // ─── Build MediaRecorder ─────────────────────────────────────────────────────
-  // IMPORTANT: MediaRecorder.start(timeslice) puts the WebM init segment
-  // (EBML header + Tracks) ONLY in the very first ondataavailable chunk.
-  // Subsequent chunks are raw Cluster elements that CANNOT be decoded on their
-  // own — Whisper (and any decoder) will fail silently on them.
-  // Fix: save the first chunk as an "init segment" and prepend it to every
-  // subsequent batch so each upload is a valid, self-contained WebM file.
-  const buildRecorder = useCallback((
+  // ─── Connect a stream to Deepgram WebSocket ─────────────────────────────────
+  // Each call opens a persistent WebSocket, starts a MediaRecorder that sends
+  // 250 ms audio chunks directly into the socket, and forwards Deepgram's
+  // real-time transcript events to the UI.
+  const connectDeepgram = useCallback(async (
     stream: MediaStream,
-    chunksRef: React.MutableRefObject<Blob[]>,
-    intervalRef: React.MutableRefObject<ReturnType<typeof setInterval> | null>,
     speaker: Speaker,
-    peakRef: React.MutableRefObject<number>,
-  ) => {
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
-    const recorder = new MediaRecorder(stream, { mimeType });
-    chunksRef.current = [];
+    setLive: (t: string) => void,
+  ): Promise<{ ws: WebSocket; recorder: MediaRecorder }> => {
+    // Fetch key from our server (keeps key out of JS bundle)
+    const res = await fetch('/api/deepgram-token');
+    if (!res.ok) throw new Error('Deepgram API key not configured — add DEEPGRAM_API_KEY to Vercel env vars');
+    const { key, error: keyErr } = await res.json();
+    if (keyErr || !key) throw new Error(keyErr || 'No Deepgram key returned');
 
-    let initChunk: Blob | null = null;   // WebM initialization segment
-    let batchNum = 0;                    // which flush interval are we on
+    const params = new URLSearchParams({
+      model:            'nova-3',       // latest, fastest, most accurate
+      language:         'en-US',
+      punctuate:        'true',
+      interim_results:  'true',         // word-by-word as you speak
+      endpointing:      '300',          // ms of silence before committing an utterance
+      smart_format:     'true',         // numbers, dates, etc. formatted nicely
+      no_delay:         'true',         // reduce interim latency
+    });
 
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) {
-        if (!initChunk) initChunk = e.data;   // first chunk = init segment, save it
-        chunksRef.current.push(e.data);
-      }
+    const ws = new WebSocket(
+      `wss://api.deepgram.com/v1/listen?${params}`,
+      ['token', key],   // Deepgram auth via WebSocket protocol header
+    );
+
+    ws.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data as string);
+        if (data.type === 'Results') {
+          const text: string = data.channel?.alternatives?.[0]?.transcript ?? '';
+          if (data.is_final) {
+            setLive('');                      // clear interim line
+            handleFinal(text, speaker);       // commit to transcript
+          } else {
+            setLive(text);                    // show live typing
+          }
+        }
+      } catch { /* malformed — ignore */ }
     };
 
-    intervalRef.current = setInterval(() => {
-      if (!chunksRef.current.length) return;
-      const toSend = [...chunksRef.current]; chunksRef.current = [];
-      batchNum++;
+    ws.onerror = () => setError('Deepgram WebSocket error — check your API key');
 
-      // Batch 1: already contains the init segment as its first element.
-      // Batch 2+: prepend saved init segment so Whisper gets a valid WebM.
-      const blobChunks = (batchNum > 1 && initChunk) ? [initChunk, ...toSend] : toSend;
+    // Wait for the socket to open before starting the recorder
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen  = () => resolve();
+      setTimeout(() => reject(new Error('Deepgram connection timed out')), 6000);
+    });
 
-      const peak = peakRef.current;
-      peakRef.current = 0;   // reset peak accumulator for next interval
-      processChunk(blobChunks, speaker, peak);
-    }, CHUNK_INTERVAL);
+    // Stream audio into the socket in small chunks (250 ms = very low latency)
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : 'audio/webm';
+    const recorder = new MediaRecorder(stream, { mimeType });
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+        ws.send(e.data);
+      }
+    };
+    recorder.start(250);  // emit every 250 ms → near-instant transcription
 
-    recorder.start(500);   // collect chunks every 500 ms for low-latency flush
-    return recorder;
-  }, [processChunk]);
+    return { ws, recorder };
+  }, [handleFinal]);
 
-  // ─── Start recording ─────────────────────────────────────────────────────────
+  // ─── Start recording ────────────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
-    setError(''); setSkippedCount(0);
+    setError(''); setLiveYou(''); setLiveClient('');
     setStatus('Requesting microphone…');
     try {
       const mic = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
       });
       setMicStream(mic);
+      setStatus('Connecting to Deepgram…');
+
+      const { ws: mWs, recorder: mRec } = await connectDeepgram(mic, 'you', setLiveYou);
+      micWsRef.current = mWs;
+      micRecRef.current = mRec;
+
       setStatus('Requesting system audio — select your Google Meet tab and enable "Share tab audio"…');
 
-      let sys: MediaStream | null = null;
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const display = await navigator.mediaDevices.getDisplayMedia({ video: true as any, audio: true });
         display.getVideoTracks().forEach((t) => t.stop());
-        sys = display;
         setSysStream(display);
+
+        if (display.getAudioTracks().length) {
+          const { ws: sWs, recorder: sRec } = await connectDeepgram(display, 'client', setLiveClient);
+          sysWsRef.current = sWs;
+          sysRecRef.current = sRec;
+          setStatus('');
+        }
       } catch {
-        setStatus('⚠️ No system audio — only your mic will be transcribed.');
+        setStatus('⚠️ No system audio captured — only your mic will be transcribed.');
       }
 
-      micRecorderRef.current = buildRecorder(mic, micChunksRef, micIntervalRef, 'you', micPeakRef);
-      if (sys?.getAudioTracks().length) {
-        systemRecorderRef.current = buildRecorder(sys, sysChunksRef, sysIntervalRef, 'client', sysPeakRef);
-        setStatus('');
-      }
       setRecording(true);
     } catch (e) {
       setError(`Could not start: ${String(e)}`); setStatus('');
     }
-  }, [buildRecorder]);
+  }, [connectDeepgram]);
 
-  // ─── Stop recording ───────────────────────────────────────────────────────────
+  // ─── Stop recording ─────────────────────────────────────────────────────────
   const stopRecording = useCallback(() => {
-    [micIntervalRef, sysIntervalRef].forEach((r) => { if (r.current) clearInterval(r.current); });
-    if (micChunksRef.current.length) processChunk([...micChunksRef.current], 'you', micPeakRef.current);
-    if (sysChunksRef.current.length) processChunk([...sysChunksRef.current], 'client', sysPeakRef.current);
-    micRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
-    systemRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
-    micRecorderRef.current?.stop(); systemRecorderRef.current?.stop();
-    micRecorderRef.current = null; systemRecorderRef.current = null;
-    micChunksRef.current = []; sysChunksRef.current = [];
-    setMicStream(null); setSysStream(null);
-    setRecording(false); setStatus('');
-  }, [processChunk]);
+    // Close recorders and sockets cleanly
+    micRecRef.current?.stop();
+    sysRecRef.current?.stop();
+    micWsRef.current?.close();
+    sysWsRef.current?.close();
+    micRecRef.current = null; sysRecRef.current = null;
+    micWsRef.current  = null; sysWsRef.current  = null;
 
+    // Release media tracks
+    micStream?.getTracks().forEach((t) => t.stop());
+    sysStream?.getTracks().forEach((t) => t.stop());
+    setMicStream(null); setSysStream(null);
+    setLiveYou(''); setLiveClient('');
+    setRecording(false); setStatus('');
+  }, [micStream, sysStream]);
+
+  // ─── Manual input ────────────────────────────────────────────────────────────
   const askManual = async () => {
     const q = manualInput.trim();
     if (!q) return;
@@ -312,8 +302,8 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
     if (hasKB) getAiAnswer(entryId, q);
   };
 
-  const pending = questions.filter((q) => !q.asked);
-  const askedQs = questions.filter((q) => q.asked);
+  const pending  = questions.filter((q) => !q.asked);
+  const askedQs  = questions.filter((q) => q.asked);
 
   return (
     <div className="flex flex-col gap-3" style={{ height: 'calc(100vh - 120px)' }}>
@@ -336,29 +326,22 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
           {hasKB ? 'Knowledge base loaded' : 'No knowledge base'}
         </div>
 
-        {skippedCount > 0 && (
-          <span className="text-xs text-slate-500">
-            {skippedCount} silence chunk{skippedCount !== 1 ? 's' : ''} skipped
-          </span>
-        )}
-
         {transcript.length > 0 && (
-          <button onClick={() => { if (confirm('Clear transcript?')) { setTranscript([]); setSkippedCount(0); } }}
+          <button onClick={() => { if (confirm('Clear transcript?')) { setTranscript([]); setLiveYou(''); setLiveClient(''); } }}
             className="ml-auto text-xs text-slate-500 hover:text-red-400 transition-colors">
             Clear transcript
           </button>
         )}
       </div>
 
-      {/* Audio level meters — real-time VAD verification */}
+      {/* Audio level meters */}
       {recording && (
         <div className="px-4 py-3 rounded-xl bg-slate-800/60 border border-slate-700 space-y-2">
-          <p className="text-xs text-slate-400 font-medium mb-1">Audio levels (0–255 peak) — anything above {SPEECH_THRESHOLD} is sent to transcription</p>
-          <LevelBar level={micLevel} label="You (mic)" color="#6366f1" />
-          <LevelBar level={sysLevel} label="Client (sys)" color="#10b981" />
-          <p className="text-xs text-slate-600 mt-1">
-            Peak &lt; {SPEECH_THRESHOLD} = skipped (silence). Peak ≥ {SPEECH_THRESHOLD} = sent to Whisper every 5 s.
+          <p className="text-xs text-slate-400 font-medium mb-1">
+            Live audio — Deepgram streams transcription word-by-word
           </p>
+          <LevelBar level={micLevel} label="You (mic)"    color="#6366f1" />
+          <LevelBar level={sysLevel} label="Client (sys)" color="#10b981" />
         </div>
       )}
 
@@ -369,9 +352,9 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
             <span>
               Press <strong className="text-slate-200">Start Recording</strong>. Allow mic → then select your{' '}
               <strong className="text-slate-200">Google Meet tab</strong> in the share dialog and tick{' '}
-              <strong className="text-slate-200">"Share tab audio"</strong>.
+              <strong className="text-slate-200">"Share tab audio"</strong>.{' '}
               Your mic = <span className="text-indigo-400">You</span> · Meet audio = <span className="text-emerald-400">Client</span>.
-              Watch the audio meters to confirm both streams are active.
+              Requires a <strong className="text-slate-200">DEEPGRAM_API_KEY</strong> env var on Vercel.
             </span>
           )}
         </div>
@@ -392,12 +375,12 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
           </div>
 
           <div className="flex-1 overflow-y-auto scrollbar-thin space-y-3 pr-1 rounded-xl bg-slate-900/50 border border-slate-800 p-4">
-            {transcript.length === 0 && (
+            {transcript.length === 0 && !liveYou && !liveClient && (
               <div className="flex items-center justify-center h-full text-slate-600 text-sm text-center">
                 {recording
                   ? <span className="flex items-center gap-2">
                       <span className="inline-flex gap-1">{[0,150,300].map((d) => <span key={d} className="w-1.5 h-1.5 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: `${d}ms` }} />)}</span>
-                      Listening — transcript appears every ~2 seconds when speech is detected
+                      Listening — words appear instantly as you speak
                     </span>
                   : 'Transcript will appear here once you start recording'}
               </div>
@@ -446,6 +429,27 @@ export default function LiveCall({ questions, context, onToggleQuestion }: Props
                 </div>
               </div>
             ))}
+
+            {/* Live interim lines — show what's being spoken right now */}
+            {liveYou && (
+              <div className="flex items-start gap-2 opacity-60">
+                <div className="flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold mt-0.5 text-white bg-indigo-600">Y</div>
+                <div className="flex-1 px-3 py-2 rounded-xl rounded-tl-sm text-sm leading-relaxed bg-indigo-950/30 border border-indigo-800/30 text-indigo-200 italic">
+                  {liveYou}
+                  <span className="inline-block w-1 h-4 bg-indigo-400 ml-1 animate-pulse align-middle" />
+                </div>
+              </div>
+            )}
+            {liveClient && (
+              <div className="flex items-start gap-2 opacity-60">
+                <div className="flex-shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold mt-0.5 text-white bg-emerald-600">C</div>
+                <div className="flex-1 px-3 py-2 rounded-xl rounded-tl-sm text-sm leading-relaxed bg-emerald-950/30 border border-emerald-800/30 text-emerald-200 italic">
+                  {liveClient}
+                  <span className="inline-block w-1 h-4 bg-emerald-400 ml-1 animate-pulse align-middle" />
+                </div>
+              </div>
+            )}
+
             <div ref={bottomRef} />
           </div>
 
