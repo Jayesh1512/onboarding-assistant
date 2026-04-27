@@ -27,11 +27,11 @@ interface Props {
 const QUESTION_STARTERS = /^(what|how|why|when|where|who|which|is|are|do|does|can|could|would|will|should|have|has|did|tell me|explain|describe)/i;
 const isLikelyQuestion = (t: string) => t.trim().endsWith('?') || QUESTION_STARTERS.test(t.trim());
 
-const GROQ_MODELS = [
-  { value: 'llama-3.1-8b-instant',    label: 'Llama 3.1 8B (fast)' },
-  { value: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B (smart)' },
-  { value: 'gemma2-9b-it',            label: 'Gemma 2 9B' },
-  { value: 'mixtral-8x7b-32768',      label: 'Mixtral 8x7B' },
+const GEMINI_MODELS = [
+  { value: 'gemini-2.0-flash',      label: 'Gemini 2.0 Flash (fast)' },
+  { value: 'gemini-2.5-pro',        label: 'Gemini 2.5 Pro (smart)' },
+  { value: 'gemini-2.0-flash-lite', label: 'Gemini Flash Lite (fastest)' },
+  { value: 'gemini-1.5-pro',        label: 'Gemini 1.5 Pro' },
 ];
 
 // ─── Level meter ─────────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ function LevelBar({ level, label, color }: { level: number; label: string; color
 export default function LiveCall({ questions, context, onToggleQuestion, onAnswerQuestion }: Props) {
   const [recording, setRecording]       = useState(false);
   const [transcript, setTranscript]     = useState<TranscriptEntry[]>([]);
-  const [model, setModel]               = useState('llama-3.1-8b-instant');
+  const [model, setModel]               = useState('gemini-2.0-flash');
   const [manualInput, setManualInput]   = useState('');
   const [status, setStatus]             = useState('');
   const [error, setError]               = useState('');
@@ -355,7 +355,7 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
 
           <select value={model} onChange={(e) => setModel(e.target.value)}
             className="px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none">
-            {GROQ_MODELS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+            {GEMINI_MODELS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
           </select>
 
           <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border ${hasKB ? 'border-green-800 bg-green-900/20 text-green-400' : 'border-slate-700 text-slate-500'}`}>

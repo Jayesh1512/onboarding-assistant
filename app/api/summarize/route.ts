@@ -1,10 +1,9 @@
 export const dynamic = 'force-dynamic';
 
 import { NextRequest } from 'next/server';
-import Groq from 'groq-sdk';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
-const SYSTEM = `You are writing professional Minutes of Meeting (MOM) for a sales/onboarding call.
-Use the transcript and captured Q&A pairs provided.
+const SYSTEM = `You write professional Minutes of Meeting (MOM) for a sales/onboarding call.
 Format your response in clean Markdown with these exact sections:
 
 ## Meeting Overview
@@ -17,7 +16,7 @@ Bullet list of the main subjects discussed.
 For each question that was asked, list the question and summarise the client's answer. If no answer was captured, say "Answer not captured".
 
 ## Client Questions & Answers Provided
-Questions the client asked and the answers given (from the AI / by you).
+Questions the client asked and the answers given.
 
 ## Key Takeaways
 The most important points, decisions, or facts from the call.
@@ -28,8 +27,8 @@ Concrete follow-up actions with implied owners where possible.
 Be concise and factual. Only use information from the transcript — do not invent details.`;
 
 export async function POST(req: NextRequest) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) return Response.json({ error: 'GROQ_API_KEY not set' }, { status: 500 });
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return Response.json({ error: 'GEMINI_API_KEY not set' }, { status: 500 });
 
   const { transcript, questions, model } = await req.json();
 
@@ -48,24 +47,20 @@ export async function POST(req: NextRequest) {
       const send = (data: object) =>
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       try {
-        const groq = new Groq({ apiKey });
-        const completion = await groq.chat.completions.create({
-          model: model || 'llama-3.3-70b-versatile',
-          stream: true,
-          temperature: 0.2,
-          max_tokens: 2000,
-          messages: [
-            { role: 'system', content: SYSTEM },
-            {
-              role: 'user',
-              content:
-                `FULL CALL TRANSCRIPT:\n${transcriptStr || '(no transcript)'}\n\n` +
-                `PREPARED Q&A CAPTURED:\n${qaStr || '(none)'}`,
-            },
-          ],
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const gemini = genAI.getGenerativeModel({
+          model: model || 'gemini-2.5-pro',   // use smart model for meeting minutes
+          systemInstruction: SYSTEM,
+          generationConfig: { temperature: 0.2, maxOutputTokens: 2000 },
         });
-        for await (const chunk of completion) {
-          const text = chunk.choices[0]?.delta?.content ?? '';
+
+        const userMsg =
+          `FULL CALL TRANSCRIPT:\n${transcriptStr || '(no transcript)'}\n\n` +
+          `PREPARED Q&A CAPTURED:\n${qaStr || '(none)'}`;
+
+        const result = await gemini.generateContentStream(userMsg);
+        for await (const chunk of result.stream) {
+          const text = chunk.text();
           if (text) send({ text });
         }
         send({ done: true });
