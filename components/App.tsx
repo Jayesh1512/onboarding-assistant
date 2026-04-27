@@ -31,6 +31,10 @@ export default function App() {
     setQuestions((prev) => prev.map((q) => q.id === id ? { ...q, asked: !q.asked } : q));
   }, [setQuestions]);
 
+  const answerQuestion = useCallback((id: string, answer: string) => {
+    setQuestions((prev) => prev.map((q) => q.id === id ? { ...q, clientAnswer: answer } : q));
+  }, [setQuestions]);
+
   const wordCount = useMemo(() => sources.reduce((acc, s) => acc + s.content.split(/\s+/).length, 0), [sources]);
 
   if (!hydrated) {
@@ -108,7 +112,7 @@ export default function App() {
 
         {tab === 'live' && (
           <div className="max-w-6xl mx-auto">
-            <LiveCall questions={questions} context={context} onToggleQuestion={toggleQuestion} />
+            <LiveCall questions={questions} context={context} onToggleQuestion={toggleQuestion} onAnswerQuestion={answerQuestion} />
           </div>
         )}
       </main>

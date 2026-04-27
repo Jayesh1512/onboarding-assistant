@@ -7,6 +7,7 @@ export interface Question {
   text: string;
   asked: boolean;
   notes: string;
+  clientAnswer?: string;   // populated live during the call
 }
 
 interface Props {
@@ -82,6 +83,12 @@ export default function QuestionChecklist({ questions, onChange }: Props) {
                   <p className={`text-sm ${q.asked ? 'text-slate-500 line-through' : 'text-slate-100'}`}>
                     <span className="text-slate-500 mr-1.5">{i + 1}.</span>{q.text}
                   </p>
+                  {q.clientAnswer && (
+                    <div className="mt-1.5 px-2 py-1.5 rounded-lg bg-emerald-900/20 border border-emerald-800/30">
+                      <p className="text-xs text-emerald-400 font-medium mb-0.5">Client answered:</p>
+                      <p className="text-xs text-emerald-300 leading-relaxed">{q.clientAnswer}</p>
+                    </div>
+                  )}
                   {q.notes && editingNotes !== q.id && <p className="text-xs text-slate-400 mt-1 italic">{q.notes}</p>}
                   {editingNotes === q.id && (
                     <div className="mt-2 flex gap-2">
