@@ -1,34 +1,40 @@
 export const dynamic = 'force-dynamic';
 
 import { NextRequest } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 
-const SYSTEM = `You are analyzing a live sales/onboarding call transcript in real time.
-
-Your job: classify the LATEST utterance by looking at the recent conversation and a list of prepared questions.
-
-Return ONLY a JSON object — no explanation, no markdown, just raw JSON — with these fields:
+const SYSTEM = `You analyze a live sales/onboarding call in real time.
+Given the latest utterance, recent conversation, and a list of prepared questions, return ONLY a JSON object — no markdown, no explanation — with exactly these fields:
 
 "matchedPreparedQuestionId": string | null
-  → If the speaker is "you" and they just asked something that SEMANTICALLY MATCHES any prepared question, return that question's id.
-  → Use FUZZY / SEMANTIC matching — minor wording differences, singular vs plural, paraphrasing, reordering all count as a match.
-  → Example: "Where is your HQ?" matches "Where is your headquarter located?"
-  → Example: "How many drones do you operate?" matches "How many docks does your company use?"
-  → If speaker is "client", always return null here.
+  If speaker is "you" and they asked something that SEMANTICALLY MATCHES a prepared question (fuzzy ok — paraphrasing, singular/plural, reordering all count), return that question's id. Otherwise null.
 
 "clientAnswerForId": string | null
-  → If the speaker is "client" AND there is a recently-asked prepared question (provided as lastAskedQuestionId), return that question's id to indicate this is the client's answer.
-  → Even partial answers count — e.g. "So we are located in Maharashtra" answers "Where is your headquarters located?"
-  → If lastAskedQuestionId is "none" or speaker is "you", return null.
+  If speaker is "client" AND lastAskedQuestionId is not "none", return lastAskedQuestionId (the client is answering it). Otherwise null.
 
 "isCompanyQuestion": boolean
-  → true ONLY if speaker is "client" and they are asking a specific question about the other party's company, product, pricing, or service.
-  → false for everything else (greetings, answers, statements, filler).`;
+  true only if speaker is "client" and they are asking about the company, product, pricing, or service.
+
+Return raw JSON only.`;
+
+function makeClient() {
+  const base = process.env.OLLAMA_URL || 'http://localhost:11434/v1';
+  return new OpenAI({ baseURL: base, apiKey: 'ollama' });
+}
+
+async function callModel(messages: OpenAI.Chat.ChatCompletionMessageParam[], withJsonMode: boolean) {
+  const params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
+    model:       process.env.OLLAMA_ANALYZE_MODEL || 'llama3.2',
+    temperature: 0,
+    max_tokens:  200,
+    messages,
+    ...(withJsonMode ? { response_format: { type: 'json_object' } } : {}),
+  };
+  const result = await makeClient().chat.completions.create(params);
+  return result.choices[0]?.message?.content ?? '{}';
+}
 
 export async function POST(req: NextRequest) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return Response.json({ error: 'GEMINI_API_KEY not set' }, { status: 500 });
-
   const { latestEntry, recentEntries, pendingQuestions, lastAskedQuestionId, hasKB } = await req.json();
 
   const contextStr = (recentEntries as { speaker: string; text: string }[])
@@ -39,37 +45,40 @@ export async function POST(req: NextRequest) {
     : '  (none)';
 
   const userMsg =
-    `LATEST UTTERANCE: [${latestEntry.speaker}] "${latestEntry.text}"\n\n` +
-    `RECENT CONVERSATION (for context):\n${contextStr}\n\n` +
+    `LATEST: [${latestEntry.speaker}] "${latestEntry.text}"\n\n` +
+    `RECENT CONVERSATION:\n${contextStr}\n\n` +
     `PREPARED QUESTIONS NOT YET ASKED:\n${questionsStr}\n\n` +
-    `LAST PREPARED QUESTION ASKED (awaiting client answer): ${lastAskedQuestionId ?? 'none'}\n` +
-    `Knowledge base available: ${hasKB}\n\n` +
-    `Remember: use fuzzy/semantic matching for questions. Return ONLY raw JSON.`;
+    `LAST ASKED QUESTION (awaiting client answer): ${lastAskedQuestionId ?? 'none'}\n` +
+    `KB available: ${hasKB}\n\nReturn raw JSON only.`;
 
-  try {
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const gemini = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',   // upgraded from flash-lite for better semantic matching
-      systemInstruction: SYSTEM,
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0,
-        maxOutputTokens: 150,
-      },
-    });
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: SYSTEM },
+    { role: 'user',   content: userMsg },
+  ];
 
-    const result = await gemini.generateContent(userMsg);
-    const raw = result.response.text();
-    const parsed = JSON.parse(raw);
-
-    return Response.json({
+  const parse = (raw: string) => {
+    const cleaned = raw.replace(/```json?\n?/gi, '').replace(/```/g, '').trim();
+    // Extract first JSON object if model adds extra text
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(match ? match[0] : cleaned);
+    return {
       matchedPreparedQuestionId: parsed.matchedPreparedQuestionId ?? null,
       clientAnswerForId:         parsed.clientAnswerForId         ?? null,
       isCompanyQuestion:         Boolean(parsed.isCompanyQuestion),
-    });
+    };
+  };
+
+  try {
+    const raw = await callModel(messages, true);
+    return Response.json(parse(raw));
   } catch (err) {
-    console.error('Analyze error:', err);
-    // Never crash the call — return safe defaults
-    return Response.json({ matchedPreparedQuestionId: null, clientAnswerForId: null, isCompanyQuestion: false });
+    // Retry without json_object mode — not all Ollama models support it
+    try {
+      const raw = await callModel(messages, false);
+      return Response.json(parse(raw));
+    } catch (err2) {
+      console.error('Analyze failed:', err2);
+      return Response.json({ matchedPreparedQuestionId: null, clientAnswerForId: null, isCompanyQuestion: false });
+    }
   }
 }

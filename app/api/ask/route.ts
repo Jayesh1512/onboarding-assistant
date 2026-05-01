@@ -1,7 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { NextRequest } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 
 const SYSTEM_PROMPT = `You are a precise onboarding assistant helping answer questions during a client onboarding call.
 
@@ -11,34 +11,48 @@ RULES:
 3. If the answer is NOT in the knowledge base, say: "I don't have that information in our knowledge base."
 4. Never guess, infer, or fabricate information.`;
 
+function makeClient() {
+  const base = process.env.OLLAMA_URL || 'http://localhost:11434/v1';
+  return new OpenAI({ baseURL: base, apiKey: 'ollama' });
+}
+
 export async function POST(req: NextRequest) {
-  const { question, context, model = 'gemini-2.0-flash' } = await req.json();
+  const { question, context, model = 'llama3.2' } = await req.json();
 
   if (!question?.trim()) return Response.json({ error: 'Question is required' }, { status: 400 });
-  if (!context?.trim())  return Response.json({ answer: 'No knowledge base loaded. Add company content in the Prep tab first.' });
-
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return Response.json({ error: 'GEMINI_API_KEY is not set.' }, { status: 500 });
+  if (!context?.trim())  return Response.json({ answer: 'No knowledge base loaded.' });
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (data: object) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+      const send = (data: object) =>
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       try {
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const gemini = genAI.getGenerativeModel({
+        const completion = await makeClient().chat.completions.create({
           model,
-          systemInstruction: `${SYSTEM_PROMPT}\n\n--- COMPANY KNOWLEDGE BASE ---\n${context.slice(0, 120000)}\n--- END ---`,
+          stream: true,
+          temperature: 0.1,
+          max_tokens: 512,
+          messages: [
+            {
+              role: 'system',
+              content: `${SYSTEM_PROMPT}\n\n--- COMPANY KNOWLEDGE BASE ---\n${context.slice(0, 80000)}\n--- END ---`,
+            },
+            { role: 'user', content: question },
+          ],
         });
-
-        const result = await gemini.generateContentStream(question);
-        for await (const chunk of result.stream) {
-          const text = chunk.text();
+        for await (const chunk of completion) {
+          const text = chunk.choices[0]?.delta?.content || '';
           if (text) send({ text });
         }
         send({ done: true });
       } catch (err) {
-        send({ error: String(err) });
+        const msg = String(err);
+        send({
+          error: msg.includes('ECONNREFUSED') || msg.includes('fetch failed')
+            ? 'Cannot reach Ollama. Make sure it is running: ollama serve'
+            : msg,
+        });
       } finally {
         controller.close();
       }

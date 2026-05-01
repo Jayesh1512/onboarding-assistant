@@ -1,35 +1,37 @@
 export const dynamic = 'force-dynamic';
 
 import { NextRequest } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 
 const SYSTEM = `You write professional Minutes of Meeting (MOM) for a sales/onboarding call.
-Format your response in clean Markdown with these exact sections:
+Format your response in clean Markdown with these sections:
 
 ## Meeting Overview
-2–3 sentence summary of what the call covered and the main outcome.
+2–3 sentence summary of what the call covered and the outcome.
 
 ## Key Topics Discussed
-Bullet list of the main subjects discussed.
+Bullet list of main subjects.
 
 ## Prepared Questions & Client Responses
-For each question that was asked, list the question and summarise the client's answer. If no answer was captured, say "Answer not captured".
+For each asked question, show the question and the client's answer. If no answer captured, say "Answer not captured".
 
 ## Client Questions & Answers Provided
 Questions the client asked and the answers given.
 
 ## Key Takeaways
-The most important points, decisions, or facts from the call.
+Most important facts, decisions, or points.
 
 ## Next Steps & Action Items
-Concrete follow-up actions with implied owners where possible.
+Concrete follow-up actions.
 
-Be concise and factual. Only use information from the transcript — do not invent details.`;
+Be concise and factual. Only use information from the transcript.`;
+
+function makeClient() {
+  const base = process.env.OLLAMA_URL || 'http://localhost:11434/v1';
+  return new OpenAI({ baseURL: base, apiKey: 'ollama' });
+}
 
 export async function POST(req: NextRequest) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return Response.json({ error: 'GEMINI_API_KEY not set' }, { status: 500 });
-
   const { transcript, questions, model } = await req.json();
 
   const transcriptStr = (transcript as { speaker: string; text: string }[])
@@ -38,7 +40,7 @@ export async function POST(req: NextRequest) {
 
   const qaStr = (questions as { text: string; asked: boolean; clientAnswer?: string }[])
     .filter((q) => q.asked)
-    .map((q) => `Q: ${q.text}\nClient response: ${q.clientAnswer?.trim() || '(not captured)'}`)
+    .map((q) => `Q: ${q.text}\nClient: ${q.clientAnswer?.trim() || '(not captured)'}`)
     .join('\n\n');
 
   const encoder = new TextEncoder();
@@ -47,25 +49,33 @@ export async function POST(req: NextRequest) {
       const send = (data: object) =>
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       try {
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const gemini = genAI.getGenerativeModel({
-          model: model || 'gemini-2.5-pro',   // use smart model for meeting minutes
-          systemInstruction: SYSTEM,
-          generationConfig: { temperature: 0.2, maxOutputTokens: 2000 },
+        const completion = await makeClient().chat.completions.create({
+          model: model || process.env.OLLAMA_SUMMARIZE_MODEL || 'llama3.2',
+          stream: true,
+          temperature: 0.2,
+          max_tokens: 2000,
+          messages: [
+            { role: 'system', content: SYSTEM },
+            {
+              role: 'user',
+              content:
+                `TRANSCRIPT:\n${transcriptStr || '(empty)'}\n\n` +
+                `PREPARED Q&A:\n${qaStr || '(none)'}`,
+            },
+          ],
         });
-
-        const userMsg =
-          `FULL CALL TRANSCRIPT:\n${transcriptStr || '(no transcript)'}\n\n` +
-          `PREPARED Q&A CAPTURED:\n${qaStr || '(none)'}`;
-
-        const result = await gemini.generateContentStream(userMsg);
-        for await (const chunk of result.stream) {
-          const text = chunk.text();
+        for await (const chunk of completion) {
+          const text = chunk.choices[0]?.delta?.content || '';
           if (text) send({ text });
         }
         send({ done: true });
       } catch (err) {
-        send({ error: String(err) });
+        const msg = String(err);
+        send({
+          error: msg.includes('ECONNREFUSED') || msg.includes('fetch failed')
+            ? 'Cannot reach Ollama. Run: ollama serve'
+            : msg,
+        });
       } finally {
         controller.close();
       }

@@ -40,12 +40,7 @@ function fuzzyMatch(spoken: string, prepared: string): boolean {
   return overlap / b.length >= 0.4;   // 40% of prepared-question keywords must appear
 }
 
-const GEMINI_MODELS = [
-  { value: 'gemini-2.0-flash',      label: 'Gemini 2.0 Flash (fast)' },
-  { value: 'gemini-2.5-pro',        label: 'Gemini 2.5 Pro (smart)' },
-  { value: 'gemini-2.0-flash-lite', label: 'Gemini Flash Lite (fastest)' },
-  { value: 'gemini-1.5-pro',        label: 'Gemini 1.5 Pro' },
-];
+// Models loaded dynamically from Ollama at runtime
 
 // ─── Level meter ─────────────────────────────────────────────────────────────
 function useLevelMeter(stream: MediaStream | null) {
@@ -87,7 +82,9 @@ function LevelBar({ level, label, color }: { level: number; label: string; color
 export default function LiveCall({ questions, context, onToggleQuestion, onAnswerQuestion }: Props) {
   const [recording, setRecording]       = useState(false);
   const [transcript, setTranscript]     = useState<TranscriptEntry[]>([]);
-  const [model, setModel]               = useState('gemini-2.0-flash');
+  const [model, setModel]               = useState('llama3.2');
+  const [ollamaModels, setOllamaModels] = useState<{ id: string; name: string }[]>([]);
+  const [ollamaError, setOllamaError]   = useState('');
   const [manualInput, setManualInput]   = useState('');
   const [status, setStatus]             = useState('');
   const [error, setError]               = useState('');
@@ -118,6 +115,21 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
   useEffect(() => { modelRef.current      = model;      },   [model]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [transcript, liveYou, liveClient]);
+
+  // Fetch available Ollama models on mount
+  useEffect(() => {
+    fetch('/api/lm-models')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.models?.length) {
+          setOllamaModels(d.models);
+          setModel(d.models[0].id);   // default to first available model
+        } else {
+          setOllamaError(d.error || 'No models found');
+        }
+      })
+      .catch(() => setOllamaError('Cannot reach Ollama'));
+  }, []);
 
   // ─── AI answer from KB ────────────────────────────────────────────────────
   const getAiAnswer = useCallback(async (entryId: string, question: string) => {
@@ -384,10 +396,18 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
 
           <select value={model} onChange={(e) => setModel(e.target.value)}
             className="px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-300 focus:outline-none">
-            {GEMINI_MODELS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+            {ollamaModels.length
+            ? ollamaModels.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)
+            : <option value="llama3.2">llama3.2 (default)</option>
+          }
           </select>
 
-          <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border ${hasKB ? 'border-green-800 bg-green-900/20 text-green-400' : 'border-slate-700 text-slate-500'}`}>
+          {ollamaError
+          ? <span className="text-xs text-red-400 px-2">⚠️ Ollama: {ollamaError}</span>
+          : ollamaModels.length > 0 && <span className="text-xs text-emerald-400">✓ Ollama ready</span>
+        }
+
+        <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border ${hasKB ? 'border-green-800 bg-green-900/20 text-green-400' : 'border-slate-700 text-slate-500'}`}>
             <div className={`w-1.5 h-1.5 rounded-full ${hasKB ? 'bg-green-400' : 'bg-slate-500'}`} />
             {hasKB ? 'Knowledge base loaded' : 'No knowledge base'}
           </div>
