@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import type { Question } from './QuestionChecklist';
 import MeetingSummary from './MeetingSummary';
+import { serializeTranscript } from '@/lib/call-types';
 
 type Speaker = 'you' | 'client';
 
@@ -94,6 +95,8 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
   const [liveClient, setLiveClient]     = useState('');
   const [showSummary, setShowSummary]   = useState(false);
   const [callEnded, setCallEnded]       = useState(false);
+  const [savedCallId, setSavedCallId]   = useState<string | null>(null);
+  const [saveCallError, setSaveCallError] = useState('');
 
   const micWsRef  = useRef<WebSocket | null>(null);
   const sysWsRef  = useRef<WebSocket | null>(null);
@@ -298,6 +301,7 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
   // ─── Start ────────────────────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
     setError(''); setLiveYou(''); setLiveClient(''); setCallEnded(false);
+    setSavedCallId(null); setSaveCallError('');
     setStatus('Requesting microphone…');
     try {
       const mic = await navigator.mediaDevices.getUserMedia({
@@ -330,7 +334,7 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
   }, [connectDeepgram]);
 
   // ─── Stop ─────────────────────────────────────────────────────────────────
-  const stopRecording = useCallback(() => {
+  const stopRecording = useCallback(async () => {
     micRecRef.current?.stop(); sysRecRef.current?.stop();
     micWsRef.current?.close(); sysWsRef.current?.close();
     micRecRef.current = null; sysRecRef.current = null;
@@ -341,6 +345,44 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
     setLiveYou(''); setLiveClient('');
     setRecording(false); setStatus('');
     setCallEnded(true);
+
+    const lines = transcriptRef.current;
+    const qs = questionsRef.current;
+    const lm = modelRef.current;
+    if (lines.length === 0) {
+      setSavedCallId(null);
+      setSaveCallError('');
+      return;
+    }
+
+    setSaveCallError('');
+    try {
+      const res = await fetch('/api/calls', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript: serializeTranscript(lines),
+          questions: qs,
+          model: lm,
+          ended_at: new Date().toISOString(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setSavedCallId(null);
+        setSaveCallError(typeof data.error === 'string' ? data.error : 'Could not save call to database');
+        return;
+      }
+      if (typeof data.id === 'string') {
+        setSavedCallId(data.id);
+      } else {
+        setSavedCallId(null);
+        setSaveCallError('Save response missing id');
+      }
+    } catch (e) {
+      setSavedCallId(null);
+      setSaveCallError(String(e));
+    }
   }, [micStream, sysStream]);
 
   // ─── Manual input ─────────────────────────────────────────────────────────
@@ -366,6 +408,7 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
           transcript={transcript}
           questions={questions}
           model={model}
+          savedCallId={savedCallId}
           onClose={() => setShowSummary(false)}
         />
       )}
@@ -383,6 +426,16 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
             <span className={`w-2 h-2 rounded-full ${recording ? 'bg-white animate-pulse' : 'bg-slate-400'}`} />
             {recording ? 'Stop Recording' : 'Start Recording'}
           </button>
+
+          {callEnded && transcript.length > 0 && saveCallError && (
+            <span className="text-xs text-amber-400 max-w-md" title={saveCallError}>
+              ⚠️ Call not saved: {saveCallError}
+            </span>
+          )}
+
+          {callEnded && transcript.length > 0 && savedCallId && !saveCallError && (
+            <span className="text-xs text-emerald-400">✓ Saved to history</span>
+          )}
 
           {callEnded && transcript.length > 0 && (
             <button onClick={() => setShowSummary(true)}
@@ -413,7 +466,7 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
           </div>
 
           {transcript.length > 0 && (
-            <button onClick={() => { if (confirm('Clear transcript?')) { setTranscript([]); setCallEnded(false); lastAskedQuestionIdRef.current = null; } }}
+            <button onClick={() => { if (confirm('Clear transcript?')) { setTranscript([]); setCallEnded(false); setSavedCallId(null); setSaveCallError(''); lastAskedQuestionIdRef.current = null; } }}
               className="ml-auto text-xs text-slate-500 hover:text-red-400 transition-colors">
               Clear transcript
             </button>

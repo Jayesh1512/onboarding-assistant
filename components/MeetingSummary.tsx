@@ -1,7 +1,9 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { Question } from './QuestionChecklist';
+import { SUMMARY_PERSIST_DEBOUNCE_MS } from '@/lib/constants';
+import { MarkdownLine } from './MarkdownLine';
 
 interface TranscriptEntry {
   id: string;
@@ -16,30 +18,18 @@ interface Props {
   transcript: TranscriptEntry[];
   questions: Question[];
   model: string;
+  /** When set, AI summary text is PATCHed to `/api/calls/[id]` after generation finishes. */
+  savedCallId?: string | null;
   onClose: () => void;
 }
 
-// Simple markdown → JSX renderer (no dependency needed)
-function MarkdownLine({ line, idx }: { line: string; idx: number }) {
-  if (line.startsWith('## '))  return <h2 key={idx} className="text-base font-semibold text-indigo-400 mt-6 mb-2 border-b border-slate-700 pb-1">{line.slice(3)}</h2>;
-  if (line.startsWith('### ')) return <h3 key={idx} className="text-sm font-semibold text-slate-300 mt-3 mb-1">{line.slice(4)}</h3>;
-  if (line.startsWith('- ') || line.startsWith('* '))
-    return <li key={idx} className="text-sm text-slate-300 ml-4 list-disc">{line.slice(2)}</li>;
-  if (!line.trim()) return <div key={idx} className="h-2" />;
-  // Bold inline **text**
-  const parts = line.split(/\*\*(.+?)\*\*/g);
-  return (
-    <p key={idx} className="text-sm text-slate-300 leading-relaxed">
-      {parts.map((p, i) => i % 2 === 1 ? <strong key={i} className="text-slate-100">{p}</strong> : p)}
-    </p>
-  );
-}
-
-export default function MeetingSummary({ transcript, questions, model, onClose }: Props) {
+export default function MeetingSummary({ transcript, questions, model, savedCallId, onClose }: Props) {
   const [summary, setSummary]     = useState('');
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState('');
   const [activeTab, setActiveTab] = useState<'summary' | 'qa' | 'transcript'>('summary');
+  /** Latest summary text for PATCH after streaming (state + ref stay in sync for timing). */
+  const summaryRef = useRef('');
 
   // Generate summary on mount
   useEffect(() => {
@@ -79,6 +69,24 @@ export default function MeetingSummary({ transcript, questions, model, onClose }
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    summaryRef.current = summary;
+  }, [summary]);
+
+  // After streaming finishes, wait one tick so the last summary chunk is committed, then PATCH.
+  useEffect(() => {
+    if (!savedCallId || loading) return;
+    const id = savedCallId;
+    const handle = window.setTimeout(() => {
+      void fetch(`/api/calls/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary: summaryRef.current }),
+      });
+    }, SUMMARY_PERSIST_DEBOUNCE_MS);
+    return () => window.clearTimeout(handle);
+  }, [savedCallId, loading]);
 
   // ─── PDF export ──────────────────────────────────────────────────────────────
   const exportPdf = () => {
@@ -230,7 +238,7 @@ export default function MeetingSummary({ transcript, questions, model, onClose }
               </div>
             )}
             {error && <p className="text-red-400 text-sm">⚠️ {error}</p>}
-            {summary.split('\n').map((line, i) => <MarkdownLine key={i} line={line} idx={i} />)}
+            {summary.split('\n').map((line, i) => <MarkdownLine key={i} line={line} />)}
             {loading && summary && (
               <span className="inline-block w-1.5 h-4 bg-indigo-400 animate-pulse ml-1 align-middle" />
             )}

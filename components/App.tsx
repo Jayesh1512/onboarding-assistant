@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback, useMemo } from 'react';
+import Link from 'next/link';
 import { useLocalStorage } from '@/lib/use-local-storage';
 import KnowledgeBase, { type KBSource } from './KnowledgeBase';
 import QuestionChecklist, { type Question } from './QuestionChecklist';
@@ -63,6 +64,11 @@ export default function App() {
 
         {/* Tab switcher */}
         <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-800 border border-slate-700">
+          <Link
+            href="/calls"
+            className="px-3 py-1.5 rounded-lg text-sm font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-700/50 transition-colors">
+            Call history
+          </Link>
           <button onClick={() => setTab('prep')}
             className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors ${tab === 'prep' ? 'bg-slate-700 text-slate-100' : 'text-slate-400 hover:text-slate-200'}`}>
             Prep
