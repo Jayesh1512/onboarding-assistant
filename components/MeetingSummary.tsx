@@ -23,6 +23,40 @@ interface Props {
   onClose: () => void;
 }
 
+const TITLE_MAX_LENGTH = 96;
+const TITLE_WORD_LIMIT = 12;
+const TITLE_DEFAULT_FALLBACK = 'Client Onboarding Meeting';
+const TITLE_SECTION_PREFIX = '## ';
+const TITLE_STRIP_MARKDOWN = /[#*_`>[\]\-]/g;
+
+function createMeetingTitleFromSummary(summary: string): string {
+  const lines = summary
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  const sectionLine = lines.find((line) => line.startsWith(TITLE_SECTION_PREFIX));
+  if (sectionLine) {
+    const sectionTitle = sectionLine
+      .replace(TITLE_SECTION_PREFIX, '')
+      .replace(TITLE_STRIP_MARKDOWN, '')
+      .trim();
+    if (sectionTitle.length > 0) {
+      return sectionTitle.slice(0, TITLE_MAX_LENGTH);
+    }
+  }
+
+  const paragraphLine = lines.find((line) => !line.startsWith('#') && line.length > 0);
+  if (!paragraphLine) return TITLE_DEFAULT_FALLBACK;
+
+  const firstSentence = paragraphLine.split(/[.!?]/)[0]?.trim() || paragraphLine;
+  const words = firstSentence.split(/\s+/).slice(0, TITLE_WORD_LIMIT);
+  const compactTitle = words.join(' ').replace(TITLE_STRIP_MARKDOWN, '').trim();
+  if (!compactTitle) return TITLE_DEFAULT_FALLBACK;
+
+  return compactTitle.slice(0, TITLE_MAX_LENGTH);
+}
+
 export default function MeetingSummary({ transcript, questions, model, savedCallId, onClose }: Props) {
   const [summary, setSummary]     = useState('');
   const [loading, setLoading]     = useState(true);
@@ -79,10 +113,11 @@ export default function MeetingSummary({ transcript, questions, model, savedCall
     if (!savedCallId || loading) return;
     const id = savedCallId;
     const handle = window.setTimeout(() => {
+      const meetingTitle = createMeetingTitleFromSummary(summaryRef.current);
       void fetch(`/api/calls/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ summary: summaryRef.current }),
+        body: JSON.stringify({ summary: summaryRef.current, title: meetingTitle }),
       });
     }, SUMMARY_PERSIST_DEBOUNCE_MS);
     return () => window.clearTimeout(handle);

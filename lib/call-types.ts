@@ -16,6 +16,7 @@ export interface CallRow {
   id: string;
   created_at: string;
   ended_at: string;
+  title: string | null;
   model: string | null;
   transcript: SerializableTranscriptEntry[];
   questions: Question[];
@@ -28,6 +29,7 @@ export interface CallListItem {
   id: string;
   created_at: string;
   ended_at: string;
+  title: string | null;
   model: string | null;
   utterance_count: number;
   questions_asked_count: number;

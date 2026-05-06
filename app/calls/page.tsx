@@ -44,7 +44,7 @@ export default async function CallsPage() {
                   className="block rounded-xl border border-slate-800 bg-slate-900/40 px-4 py-3 hover:border-indigo-700/50 hover:bg-slate-800/30 transition-colors">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-sm font-medium text-slate-200">
-                      {new Date(c.created_at).toLocaleString()}
+                      {c.title?.trim() || 'Untitled meeting'}
                     </span>
                     {c.has_summary ? (
                       <span className="text-xs text-emerald-400">Summary</span>
@@ -53,7 +53,7 @@ export default async function CallsPage() {
                     )}
                   </div>
                   <p className="text-xs text-slate-500 mt-1">
-                    {c.utterance_count} utterances · {c.questions_asked_count} questions asked
+                    {new Date(c.ended_at).toLocaleString()} · {c.utterance_count} utterances · {c.questions_asked_count} questions asked
                     {c.model ? ` · ${c.model}` : ''}
                   </p>
                 </Link>

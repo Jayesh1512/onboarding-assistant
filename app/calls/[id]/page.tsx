@@ -34,7 +34,9 @@ export default async function CallDetailPage({ params }: { params: Promise<{ id:
           <Link href="/calls" className="text-xs font-medium text-indigo-400 hover:text-indigo-300">
             ← Call history
           </Link>
-          <h1 className="text-sm font-semibold text-slate-100 mt-2">Call · {new Date(call.created_at).toLocaleString()}</h1>
+          <h1 className="text-sm font-semibold text-slate-100 mt-2">
+            {call.title?.trim() || 'Untitled meeting'}
+          </h1>
           <p className="text-xs text-slate-500 mt-0.5">
             Ended {new Date(call.ended_at).toLocaleString()}
             {call.model ? ` · Model: ${call.model}` : ''}

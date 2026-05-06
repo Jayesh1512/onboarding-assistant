@@ -43,11 +43,21 @@ export async function PATCH(
   }
 
   const summary = (body as Record<string, unknown>).summary;
-  if (typeof summary !== 'string') {
-    return Response.json({ error: 'summary must be a string' }, { status: 400 });
+  const title = (body as Record<string, unknown>).title;
+  if (summary !== undefined && typeof summary !== 'string') {
+    return Response.json({ error: 'summary must be a string when provided' }, { status: 400 });
+  }
+  if (title !== undefined && typeof title !== 'string') {
+    return Response.json({ error: 'title must be a string when provided' }, { status: 400 });
+  }
+  if (summary === undefined && title === undefined) {
+    return Response.json({ error: 'Provide summary and/or title' }, { status: 400 });
   }
 
-  const updated = await updateCallSummary(id, summary);
+  const updated = await updateCallSummary(id, {
+    ...(summary !== undefined ? { summary } : {}),
+    ...(title !== undefined ? { title } : {}),
+  });
   if (!updated.ok) {
     if (updated.notFound) {
       return Response.json({ error: updated.error }, { status: 404 });

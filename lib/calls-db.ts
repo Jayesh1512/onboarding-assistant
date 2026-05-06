@@ -18,6 +18,7 @@ function parseCallRow(row: Record<string, unknown>): CallRow | null {
     id,
     created_at,
     ended_at,
+    title: typeof row.title === 'string' ? row.title : null,
     model: typeof row.model === 'string' ? row.model : null,
     transcript: transcript as SerializableTranscriptEntry[],
     questions: questions as Question[],
@@ -35,7 +36,7 @@ export async function listCallsFromDb(): Promise<{ ok: true; calls: CallListItem
 
   const { data, error } = await admin
     .from(SUPABASE_CALLS_TABLE)
-    .select('id, created_at, ended_at, model, utterance_count, questions_asked_count, summary')
+    .select('id, created_at, ended_at, title, model, utterance_count, questions_asked_count, summary')
     .order('created_at', { ascending: false })
     .limit(CALLS_LIST_LIMIT);
 
@@ -47,6 +48,7 @@ export async function listCallsFromDb(): Promise<{ ok: true; calls: CallListItem
     id: row.id as string,
     created_at: row.created_at as string,
     ended_at: row.ended_at as string,
+    title: (row.title as string | null) ?? null,
     model: (row.model as string | null) ?? null,
     utterance_count: Number(row.utterance_count ?? 0),
     questions_asked_count: Number(row.questions_asked_count ?? 0),
@@ -117,7 +119,7 @@ export async function insertCallRow(input: {
 
 export async function updateCallSummary(
   id: string,
-  summary: string,
+  updates: { summary?: string; title?: string },
 ): Promise<{ ok: true } | { ok: false; error: string; notFound?: boolean }> {
   const admin = getSupabaseAdmin();
   if (!admin) {
@@ -126,7 +128,7 @@ export async function updateCallSummary(
 
   const { data, error } = await admin
     .from(SUPABASE_CALLS_TABLE)
-    .update({ summary })
+    .update(updates)
     .eq('id', id)
     .select('id')
     .maybeSingle();
