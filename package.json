@@ -11,6 +11,7 @@
   "dependencies": {
     "@deepgram/sdk": "^5.1.0",
     "@google/generative-ai": "^0.24.1",
+    "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.105.1",
     "@types/cheerio": "^0.22.35",
     "@types/pdf-parse": "^1.1.5",

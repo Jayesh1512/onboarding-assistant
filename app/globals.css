@@ -14,3 +14,45 @@ body {
 .scrollbar-thin::-webkit-scrollbar { width: 4px; }
 .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
 .scrollbar-thin::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+
+.control-dock {
+  border-radius: 14px;
+  border: 2px solid #7a7467;
+  background: linear-gradient(180deg, #dfddd7 0%, #cbc6bb 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.1),
+    0 8px 16px rgba(15, 23, 42, 0.2);
+  padding: 6px;
+}
+
+.btn-3d {
+  border-radius: 10px;
+  border: 2px solid #7a7467;
+  font-weight: 700;
+  transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12),
+    0 3px 0 #6f695f,
+    0 6px 10px rgba(15, 23, 42, 0.18);
+}
+
+.btn-3d:active {
+  transform: translateY(2px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.58),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.2),
+    0 1px 0 #6f695f,
+    0 2px 4px rgba(15, 23, 42, 0.18);
+}
+
+.btn-3d-primary {
+  color: #5a3500;
+  background: linear-gradient(90deg, #eba53f 0%, #f2bf71 48%, #eba53f 100%);
+}
+
+.btn-3d-secondary {
+  color: #6a6458;
+  background: linear-gradient(180deg, #dfddd2 0%, #cfcbbf 100%);
+}
