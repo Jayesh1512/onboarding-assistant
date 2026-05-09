@@ -1,7 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { NextRequest } from 'next/server';
-import OpenAI from 'openai';
+import { makeOllamaClient, getBestModel, ollamaError } from '@/lib/ollama';
 
 const SYSTEM = `You write professional Minutes of Meeting (MOM) for a sales/onboarding call.
 Format your response in clean Markdown with these sections:
@@ -26,13 +26,9 @@ Concrete follow-up actions.
 
 Be concise and factual. Only use information from the transcript.`;
 
-function makeClient() {
-  const base = process.env.OLLAMA_URL || 'http://localhost:11434/v1';
-  return new OpenAI({ baseURL: base, apiKey: 'ollama' });
-}
-
 export async function POST(req: NextRequest) {
   const { transcript, questions, model } = await req.json();
+  const resolvedModel = model || await getBestModel();
 
   const transcriptStr = (transcript as { speaker: string; text: string }[])
     .map((e) => `[${e.speaker === 'you' ? 'YOU' : 'CLIENT'}] ${e.text}`)
@@ -49,8 +45,8 @@ export async function POST(req: NextRequest) {
       const send = (data: object) =>
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       try {
-        const completion = await makeClient().chat.completions.create({
-          model: model || process.env.OLLAMA_SUMMARIZE_MODEL || 'llama3.2',
+        const completion = await makeOllamaClient().chat.completions.create({
+          model: resolvedModel,
           stream: true,
           temperature: 0.2,
           max_tokens: 2000,
@@ -70,12 +66,7 @@ export async function POST(req: NextRequest) {
         }
         send({ done: true });
       } catch (err) {
-        const msg = String(err);
-        send({
-          error: msg.includes('ECONNREFUSED') || msg.includes('fetch failed')
-            ? 'Cannot reach Ollama. Run: ollama serve'
-            : msg,
-        });
+        send({ error: ollamaError(String(err)) });
       } finally {
         controller.close();
       }

@@ -81,7 +81,7 @@ function LevelBar({ level, label, color }: { level: number; label: string; color
 export default function LiveCall({ questions, context, onToggleQuestion, onAnswerQuestion, prepareHref }: Props) {
   const [recording, setRecording]       = useState(false);
   const [transcript, setTranscript]     = useState<TranscriptEntry[]>([]);
-  const [model, setModel]               = useState('llama3.2');
+  const [model, setModel]               = useState('gemma4:latest');
   const [ollamaModels, setOllamaModels] = useState<{ id: string; name: string }[]>([]);
   const [ollamaError, setOllamaError]   = useState('');
   const [manualInput, setManualInput]   = useState('');
@@ -162,7 +162,7 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
     try {
       const res = await fetch('/api/analyze', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ latestEntry: { speaker, text }, recentEntries, pendingQuestions, lastAskedQuestionId: lastAskedQuestionIdRef.current, hasKB }),
+        body: JSON.stringify({ latestEntry: { speaker, text }, recentEntries, pendingQuestions, lastAskedQuestionId: lastAskedQuestionIdRef.current, hasKB, model: modelRef.current }),
       });
       const analysis = await res.json();
 
@@ -340,7 +340,7 @@ export default function LiveCall({ questions, context, onToggleQuestion, onAnswe
           >
             {ollamaModels.length
               ? ollamaModels.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)
-              : <option value="llama3.2">llama3.2 (default)</option>
+              : <option value="gemma4:latest">gemma4:latest</option>
             }
           </select>
 

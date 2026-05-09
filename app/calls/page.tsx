@@ -1,10 +1,12 @@
 import Link from 'next/link';
 import { listCallsFromDb } from '@/lib/calls-db';
+import { createSupabaseServerClient } from '@/lib/supabase/server';
 
 export const dynamic = 'force-dynamic';
 
 export default async function CallsPage() {
-  const result = await listCallsFromDb();
+  const supabase = await createSupabaseServerClient();
+  const result = await listCallsFromDb(supabase);
 
   return (
     <div className="min-h-screen flex flex-col">

@@ -37,12 +37,13 @@ export default function MeetingLivePage({ params }: { params: Promise<{ id: stri
     [hydrated, state.meetings, id],
   );
 
-  // Build question list only after both API calls complete and meeting is known
+  // Build question list only after both API calls complete and meeting is known.
+  // All global questions from DB are included + meeting-specific custom questions.
   useEffect(() => {
     if (!meeting || !hydrated || !questionsApiLoaded) return;
-    const globalQs = globalQuestions
-      .filter((q) => meeting.questionIds.includes(q.id))
-      .map((q): Question => ({ id: q.id, text: q.text, asked: false, notes: q.category ?? '' }));
+    const globalQs = globalQuestions.map(
+      (q): Question => ({ id: q.id, text: q.text, asked: false, notes: q.category ?? '' }),
+    );
     const customQs = meeting.customQuestions.map(
       (q): Question => ({ id: q.id, text: q.text, asked: false, notes: '' }),
     );

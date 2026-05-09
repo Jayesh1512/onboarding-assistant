@@ -1,22 +1,44 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { DUMMY_PAST_MEETINGS, CATEGORY_COLORS } from '../page';
 import { HOME_BUTTON_3D_SECONDARY } from '@/lib/home-button-styles';
+import type { CallRow } from '@/lib/call-types';
 
-type ActiveTab = 'minutes' | 'qa' | 'transcript';
+type ActiveTab = 'summary' | 'qa' | 'transcript';
 
 export default function PastMeetingDetailPage() {
   const { id } = useParams<{ id: string }>();
-  const meeting = DUMMY_PAST_MEETINGS.find((m) => m.id === id);
-  const [activeTab, setActiveTab] = useState<ActiveTab>('minutes');
+  const [call, setCall] = useState<CallRow | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<ActiveTab>('summary');
 
-  if (!meeting) {
+  useEffect(() => {
+    if (!id) return;
+    fetch(`/api/calls/${id}`)
+      .then((r) => r.json())
+      .then(({ call: data, error: err }) => {
+        if (err) setError(err);
+        else setCall(data ?? null);
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoading(false));
+  }, [id]);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="w-5 h-5 border-2 border-orange-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (error || !call) {
     return (
       <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center gap-4">
-        <p className="text-lg font-semibold text-slate-900">Meeting not found</p>
+        <p className="text-lg font-semibold text-slate-900">{error ?? 'Meeting not found'}</p>
         <Link href="/past-meetings" className={`${HOME_BUTTON_3D_SECONDARY} px-4 py-2 text-sm`}>
           ← Back to Past Meetings
         </Link>
@@ -24,16 +46,18 @@ export default function PastMeetingDetailPage() {
     );
   }
 
-  const catColor = CATEGORY_COLORS[meeting.category] ?? CATEGORY_COLORS.Default;
+  const title = call.title ?? 'Untitled meeting';
+  const date = new Date(call.ended_at).toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
+  const hasSummary = Boolean(call.summary?.trim());
+  const askedQuestions = call.questions.filter((q) => q.asked);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
-      {/* Header */}
       <header className="sticky top-0 z-20 border-b border-slate-200 bg-slate-50/90 backdrop-blur">
         <div className="mx-auto flex w-full max-w-5xl items-center justify-between px-6 py-4">
           <div>
             <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Past Meeting</p>
-            <h1 className="text-lg font-semibold truncate max-w-sm">{meeting.title}</h1>
+            <h1 className="text-lg font-semibold truncate max-w-sm">{title}</h1>
           </div>
           <Link href="/past-meetings" className={`${HOME_BUTTON_3D_SECONDARY} inline-block px-4 py-2 text-sm whitespace-nowrap`}>
             ← Back
@@ -42,43 +66,43 @@ export default function PastMeetingDetailPage() {
       </header>
 
       <main className="mx-auto w-full max-w-5xl px-6 py-10 space-y-6">
-
         {/* Meeting info card */}
         <section className="rounded-2xl border border-slate-200 bg-white p-6">
           <div className="flex flex-wrap items-center gap-3 mb-4">
-            <h2 className="text-2xl font-semibold text-slate-900">{meeting.title}</h2>
-            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${catColor}`}>
-              {meeting.category}
-            </span>
+            <h2 className="text-2xl font-semibold text-slate-900">{title}</h2>
+            {hasSummary && (
+              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700">
+                Summary
+              </span>
+            )}
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 text-sm">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
             <div>
               <p className="text-[10px] uppercase tracking-widest font-semibold text-slate-400 mb-1">Date</p>
-              <p className="text-slate-800 font-medium">{meeting.date}</p>
+              <p className="text-slate-800 font-medium">{date}</p>
             </div>
             <div>
-              <p className="text-[10px] uppercase tracking-widest font-semibold text-slate-400 mb-1">Time</p>
-              <p className="text-slate-800 font-medium">{meeting.time}</p>
+              <p className="text-[10px] uppercase tracking-widest font-semibold text-slate-400 mb-1">Utterances</p>
+              <p className="text-slate-800 font-medium">{call.utterance_count}</p>
             </div>
-            <div className="col-span-2 sm:col-span-1">
-              <p className="text-[10px] uppercase tracking-widest font-semibold text-slate-400 mb-2">Attendees</p>
-              <div className="flex flex-wrap gap-1.5">
-                {meeting.attendees.map((a, i) => (
-                  <span key={i} className="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-100 text-[11px] font-medium text-slate-600">
-                    {a}
-                  </span>
-                ))}
+            <div>
+              <p className="text-[10px] uppercase tracking-widest font-semibold text-slate-400 mb-1">Questions Asked</p>
+              <p className="text-slate-800 font-medium">{call.questions_asked_count}</p>
+            </div>
+            {call.model && (
+              <div>
+                <p className="text-[10px] uppercase tracking-widest font-semibold text-slate-400 mb-1">Model</p>
+                <p className="text-slate-800 font-medium">{call.model}</p>
               </div>
-            </div>
+            )}
           </div>
         </section>
 
         {/* Content tabs */}
         <section className="rounded-2xl border border-slate-200 bg-white p-6">
-          {/* Tab bar */}
           <div className="flex bg-slate-100 p-1 rounded-xl w-fit mb-6">
-            {(['minutes', 'qa', 'transcript'] as ActiveTab[]).map((tab) => (
+            {(['summary', 'qa', 'transcript'] as ActiveTab[]).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
@@ -93,49 +117,94 @@ export default function PastMeetingDetailPage() {
             ))}
           </div>
 
-          {/* Minutes */}
-          {activeTab === 'minutes' && (
-            <ul className="space-y-3">
-              {meeting.minutes.map((point, i) => (
-                <li key={i} className="flex gap-3 text-sm text-slate-700 leading-relaxed">
-                  <span className="mt-0.5 w-5 h-5 flex-shrink-0 rounded-full bg-orange-100 text-orange-600 flex items-center justify-center text-[11px] font-bold">
-                    {i + 1}
-                  </span>
-                  {point}
-                </li>
-              ))}
-            </ul>
+          {/* Summary */}
+          {activeTab === 'summary' && (
+            <div>
+              {call.summary ? (
+                <div className="prose prose-sm max-w-none text-slate-700 whitespace-pre-wrap leading-relaxed">
+                  {call.summary}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed border-slate-200 p-8 text-center">
+                  <p className="text-sm font-medium text-slate-500">No summary available</p>
+                  <p className="mt-1 text-xs text-slate-400">A summary is generated at the end of a live call.</p>
+                </div>
+              )}
+            </div>
           )}
 
           {/* Q&A */}
           {activeTab === 'qa' && (
             <div className="space-y-4">
-              {meeting.qa.map((item, i) => (
-                <div key={i} className="rounded-xl bg-slate-50 border border-slate-200 p-5">
-                  <p className="text-sm font-semibold text-slate-900 mb-3 flex gap-2">
-                    <span className="text-orange-500 shrink-0">Q.</span>
-                    {item.question}
-                  </p>
-                  <p className="text-sm text-slate-600 leading-relaxed flex gap-2">
-                    <span className="font-bold text-slate-500 shrink-0">A.</span>
-                    {item.answer}
-                  </p>
+              {askedQuestions.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-slate-200 p-8 text-center">
+                  <p className="text-sm font-medium text-slate-500">No questions were asked in this meeting</p>
                 </div>
-              ))}
+              ) : (
+                askedQuestions.map((q, i) => (
+                  <div key={q.id ?? i} className="rounded-xl bg-slate-50 border border-slate-200 p-5">
+                    <p className="text-sm font-semibold text-slate-900 mb-3 flex gap-2">
+                      <span className="text-orange-500 shrink-0">Q.</span>
+                      {q.text}
+                    </p>
+                    <p className="text-sm text-slate-600 leading-relaxed flex gap-2">
+                      <span className="font-bold text-slate-500 shrink-0">A.</span>
+                      {q.clientAnswer?.trim() || <span className="italic text-slate-400">Answer not captured</span>}
+                    </p>
+                    {q.notes?.trim() && (
+                      <p className="mt-2 text-xs text-slate-400 italic pl-4 border-l-2 border-slate-200">
+                        Note: {q.notes}
+                      </p>
+                    )}
+                  </div>
+                ))
+              )}
             </div>
           )}
 
           {/* Transcript */}
           {activeTab === 'transcript' && (
             <div>
-              <p className="text-xs text-slate-500 mb-3">Full conversation transcript</p>
-              <div className="bg-slate-900 rounded-xl p-5 font-mono text-xs text-slate-300 leading-7 whitespace-pre-wrap max-h-96 overflow-y-auto">
-                {meeting.transcript}
-              </div>
+              {call.transcript.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-slate-200 p-8 text-center">
+                  <p className="text-sm font-medium text-slate-500">No transcript available</p>
+                </div>
+              ) : (
+                <div className="space-y-2 max-h-[600px] overflow-y-auto pr-1">
+                  {call.transcript.map((entry, i) => {
+                    const isYou = entry.speaker === 'you';
+                    return (
+                      <div key={entry.id ?? i} className={`flex gap-2 ${isYou ? 'justify-end' : 'justify-start'}`}>
+                        <div
+                          className={`max-w-[75%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                            isYou
+                              ? 'bg-indigo-50 border border-indigo-200 text-indigo-900'
+                              : entry.isQuestion
+                              ? 'bg-amber-50 border border-amber-200 text-amber-900'
+                              : 'bg-emerald-50 border border-emerald-200 text-emerald-900'
+                          }`}
+                        >
+                          <p className={`text-[10px] font-semibold uppercase mb-1 ${
+                            isYou ? 'text-indigo-400' : entry.isQuestion ? 'text-amber-500' : 'text-emerald-500'
+                          }`}>
+                            {isYou ? 'You' : entry.isQuestion ? 'Client (question)' : 'Client'}
+                          </p>
+                          <p>{entry.text}</p>
+                          {entry.aiAnswer && (
+                            <div className="mt-2 pt-2 border-t border-current/20">
+                              <p className="text-[10px] font-semibold uppercase mb-1 opacity-60">AI Answer</p>
+                              <p className="opacity-80">{entry.aiAnswer}</p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
         </section>
-
       </main>
     </div>
   );

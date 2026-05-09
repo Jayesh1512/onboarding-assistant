@@ -1,13 +1,15 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { getCallByIdFromDb } from '@/lib/calls-db';
+import { createSupabaseServerClient } from '@/lib/supabase/server';
 import CallHistoryDetail from '@/components/CallHistoryDetail';
 
 export const dynamic = 'force-dynamic';
 
 export default async function CallDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const result = await getCallByIdFromDb(id);
+  const supabase = await createSupabaseServerClient();
+  const result = await getCallByIdFromDb(supabase, id);
 
   if (!result.ok) {
     if (result.notFound) notFound();

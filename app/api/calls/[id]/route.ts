@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server';
+import { createSupabaseServerClient } from '@/lib/supabase/server';
 import { getCallByIdFromDb, updateCallSummary } from '@/lib/calls-db';
 
 export async function GET(
@@ -10,13 +11,14 @@ export async function GET(
     return Response.json({ error: 'Invalid id' }, { status: 400 });
   }
 
-  const result = await getCallByIdFromDb(id);
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
+  const result = await getCallByIdFromDb(supabase, id);
   if (!result.ok) {
-    if (result.notFound) {
-      return Response.json({ error: result.error }, { status: 404 });
-    }
-    const status = result.error === 'Supabase is not configured' ? 503 : 500;
-    return Response.json({ error: result.error }, { status });
+    if (result.notFound) return Response.json({ error: result.error }, { status: 404 });
+    return Response.json({ error: result.error }, { status: 500 });
   }
 
   return Response.json({ call: result.call });
@@ -30,6 +32,10 @@ export async function PATCH(
   if (!id || typeof id !== 'string') {
     return Response.json({ error: 'Invalid id' }, { status: 400 });
   }
+
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
 
   let body: unknown;
   try {
@@ -54,16 +60,14 @@ export async function PATCH(
     return Response.json({ error: 'Provide summary and/or title' }, { status: 400 });
   }
 
-  const updated = await updateCallSummary(id, {
+  const updated = await updateCallSummary(supabase, id, {
     ...(summary !== undefined ? { summary } : {}),
     ...(title !== undefined ? { title } : {}),
   });
+
   if (!updated.ok) {
-    if (updated.notFound) {
-      return Response.json({ error: updated.error }, { status: 404 });
-    }
-    const status = updated.error === 'Supabase is not configured' ? 503 : 500;
-    return Response.json({ error: updated.error }, { status });
+    if (updated.notFound) return Response.json({ error: updated.error }, { status: 404 });
+    return Response.json({ error: updated.error }, { status: 500 });
   }
 
   return Response.json({ ok: true });

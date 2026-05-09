@@ -1,4 +1,4 @@
-import { getSupabaseAdmin } from '@/lib/supabase/admin';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { SUPABASE_CALLS_TABLE, CALLS_LIST_LIMIT } from '@/lib/constants';
 import type { CallListItem, CallRow, Question, SerializableTranscriptEntry } from '@/lib/call-types';
 
@@ -28,13 +28,10 @@ function parseCallRow(row: Record<string, unknown>): CallRow | null {
   };
 }
 
-export async function listCallsFromDb(): Promise<{ ok: true; calls: CallListItem[] } | { ok: false; error: string }> {
-  const admin = getSupabaseAdmin();
-  if (!admin) {
-    return { ok: false, error: 'Supabase is not configured' };
-  }
-
-  const { data, error } = await admin
+export async function listCallsFromDb(
+  supabase: SupabaseClient,
+): Promise<{ ok: true; calls: CallListItem[] } | { ok: false; error: string }> {
+  const { data, error } = await supabase
     .from(SUPABASE_CALLS_TABLE)
     .select('id, created_at, ended_at, title, model, utterance_count, questions_asked_count, summary')
     .order('created_at', { ascending: false })
@@ -59,14 +56,14 @@ export async function listCallsFromDb(): Promise<{ ok: true; calls: CallListItem
 }
 
 export async function getCallByIdFromDb(
+  supabase: SupabaseClient,
   id: string,
 ): Promise<{ ok: true; call: CallRow } | { ok: false; error: string; notFound?: boolean }> {
-  const admin = getSupabaseAdmin();
-  if (!admin) {
-    return { ok: false, error: 'Supabase is not configured' };
-  }
-
-  const { data, error } = await admin.from(SUPABASE_CALLS_TABLE).select('*').eq('id', id).maybeSingle();
+  const { data, error } = await supabase
+    .from(SUPABASE_CALLS_TABLE)
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
 
   if (error) {
     return { ok: false, error: error.message };
@@ -84,22 +81,22 @@ export async function getCallByIdFromDb(
   return { ok: true, call };
 }
 
-export async function insertCallRow(input: {
-  ended_at: string;
-  model: string | null;
-  transcript: SerializableTranscriptEntry[];
-  questions: Question[];
-  utterance_count: number;
-  questions_asked_count: number;
-}): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
-  const admin = getSupabaseAdmin();
-  if (!admin) {
-    return { ok: false, error: 'Supabase is not configured' };
-  }
-
-  const { data, error } = await admin
+export async function insertCallRow(
+  supabase: SupabaseClient,
+  userId: string,
+  input: {
+    ended_at: string;
+    model: string | null;
+    transcript: SerializableTranscriptEntry[];
+    questions: Question[];
+    utterance_count: number;
+    questions_asked_count: number;
+  },
+): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const { data, error } = await supabase
     .from(SUPABASE_CALLS_TABLE)
     .insert({
+      user_id: userId,
       ended_at: input.ended_at,
       model: input.model,
       transcript: input.transcript,
@@ -118,15 +115,11 @@ export async function insertCallRow(input: {
 }
 
 export async function updateCallSummary(
+  supabase: SupabaseClient,
   id: string,
   updates: { summary?: string; title?: string },
 ): Promise<{ ok: true } | { ok: false; error: string; notFound?: boolean }> {
-  const admin = getSupabaseAdmin();
-  if (!admin) {
-    return { ok: false, error: 'Supabase is not configured' };
-  }
-
-  const { data, error } = await admin
+  const { data, error } = await supabase
     .from(SUPABASE_CALLS_TABLE)
     .update(updates)
     .eq('id', id)

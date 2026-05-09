@@ -1,7 +1,7 @@
 export const dynamic = 'force-dynamic';
 
 import { NextRequest } from 'next/server';
-import OpenAI from 'openai';
+import { makeOllamaClient, getBestModel, ollamaError } from '@/lib/ollama';
 
 const SYSTEM_PROMPT = `You are a precise onboarding assistant helping answer questions during a client onboarding call.
 
@@ -11,13 +11,9 @@ RULES:
 3. If the answer is NOT in the knowledge base, say: "I don't have that information in our knowledge base."
 4. Never guess, infer, or fabricate information.`;
 
-function makeClient() {
-  const base = process.env.OLLAMA_URL || 'http://localhost:11434/v1';
-  return new OpenAI({ baseURL: base, apiKey: 'ollama' });
-}
-
 export async function POST(req: NextRequest) {
-  const { question, context, model = 'llama3.2' } = await req.json();
+  const { question, context, model } = await req.json();
+  const resolvedModel = model || await getBestModel();
 
   if (!question?.trim()) return Response.json({ error: 'Question is required' }, { status: 400 });
   if (!context?.trim())  return Response.json({ answer: 'No knowledge base loaded.' });
@@ -28,8 +24,8 @@ export async function POST(req: NextRequest) {
       const send = (data: object) =>
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
       try {
-        const completion = await makeClient().chat.completions.create({
-          model,
+        const completion = await makeOllamaClient().chat.completions.create({
+          model: resolvedModel,
           stream: true,
           temperature: 0.1,
           max_tokens: 512,
@@ -47,12 +43,7 @@ export async function POST(req: NextRequest) {
         }
         send({ done: true });
       } catch (err) {
-        const msg = String(err);
-        send({
-          error: msg.includes('ECONNREFUSED') || msg.includes('fetch failed')
-            ? 'Cannot reach Ollama. Make sure it is running: ollama serve'
-            : msg,
-        });
+        send({ error: ollamaError(String(err)) });
       } finally {
         controller.close();
       }

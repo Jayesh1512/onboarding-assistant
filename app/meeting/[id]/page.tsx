@@ -146,15 +146,15 @@ export default function MeetingPreparePage({ params }: { params: Promise<{ id: s
         <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
            <div className="flex items-center justify-between mb-4">
              <h2 className="text-xl font-semibold text-slate-900">Meeting Details</h2>
-             <a
-               href={`/meeting/${id}/live`}
-               target="_blank"
-               rel="noreferrer"
-               onClick={() => { if (meeting.meetLink) window.open(meeting.meetLink, '_blank'); }}
-               className={`${HOME_BUTTON_3D_PRIMARY} px-4 py-2 text-sm inline-flex items-center`}
+             <button
+               onClick={() => {
+                 if (meeting.meetLink) window.open(meeting.meetLink, '_blank');
+                 router.push(`/meeting/${id}/live`);
+               }}
+               className={`${HOME_BUTTON_3D_PRIMARY} px-4 py-2 text-sm`}
              >
                Join Meeting
-             </a>
+             </button>
            </div>
 
            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">

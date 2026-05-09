@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server';
+import { createSupabaseServerClient } from '@/lib/supabase/server';
 import { insertCallRow, listCallsFromDb } from '@/lib/calls-db';
 import type { Question, SerializableTranscriptEntry } from '@/lib/call-types';
 
@@ -25,15 +26,22 @@ function isQuestion(x: unknown): x is Question {
 }
 
 export async function GET() {
-  const result = await listCallsFromDb();
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return Response.json({ error: 'Unauthorized', calls: [] }, { status: 401 });
+
+  const result = await listCallsFromDb(supabase);
   if (!result.ok) {
-    const status = result.error === 'Supabase is not configured' ? 503 : 500;
-    return Response.json({ error: result.error, calls: [] }, { status });
+    return Response.json({ error: result.error, calls: [] }, { status: 500 });
   }
   return Response.json({ calls: result.calls });
 }
 
 export async function POST(req: NextRequest) {
+  const supabase = await createSupabaseServerClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 });
+
   let body: unknown;
   try {
     body = await req.json();
@@ -60,22 +68,19 @@ export async function POST(req: NextRequest) {
 
   const transcript = transcriptRaw as SerializableTranscriptEntry[];
   const questions = questionsRaw as Question[];
-  const utterance_count = transcript.length;
-  const questions_asked_count = questions.filter((q) => q.asked).length;
 
-  const inserted = await insertCallRow({
+  const inserted = await insertCallRow(supabase, user.id, {
     ended_at: endedAt,
     model,
     transcript,
     questions,
-    utterance_count,
-    questions_asked_count,
+    utterance_count: transcript.length,
+    questions_asked_count: questions.filter((q) => q.asked).length,
   });
 
   if (!inserted.ok) {
-    const status = inserted.error === 'Supabase is not configured' ? 503 : 500;
-    console.error('Supabase insert call:', inserted.error);
-    return Response.json({ error: inserted.error }, { status });
+    console.error('Insert call failed:', inserted.error);
+    return Response.json({ error: inserted.error }, { status: 500 });
   }
 
   return Response.json({ id: inserted.id });
